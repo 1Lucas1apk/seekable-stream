@@ -1,0 +1,34 @@
+{
+  "name": "@ecliptia/seekable-stream",
+  "version": "1.0.0",
+  "description": "A Node.js library to seek and stream remote audio files without WASM.",
+  "main": "src/index.js",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "test": "node test/integration.test.mjs"
+  },
+  "keywords": [
+    "audio",
+    "stream",
+    "seek",
+    "http",
+    "nodejs"
+  ],
+  "author": "Luca",
+  "license": "ISC",
+  "dependencies": {
+    "@alexanderolsen/libsamplerate-js": "^2.1.2",
+    "@discordjs/opus": "^0.10.0",
+    "@ecliptia/faad2-wasm": "^2.11.2-ecliptia.2",
+    "@wasm-audio-decoders/flac": "^0.2.10",
+    "@wasm-audio-decoders/ogg-vorbis": "^0.1.20",
+    "codec-parser": "^2.5.0",
+    "mpg123-decoder": "^1.0.3",
+    "ogg-opus-decoder": "^1.7.3",
+    "prism-media": "^1.3.5"
+  }
+}

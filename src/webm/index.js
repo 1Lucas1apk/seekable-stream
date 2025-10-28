@@ -1,0 +1,1 @@
+export { default as WebmParser } from './parser.js';
