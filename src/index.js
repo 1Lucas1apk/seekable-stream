@@ -6,7 +6,7 @@ import fs from 'fs/promises';
 import CodecParser from 'codec-parser';
 import { WebmParser } from './webm/index.js';
 
-class SeekError extends Error {
+export class SeekError extends Error {
 	constructor(code, message, hint = '', traceId = '', resolvedRanges = []) {
 		super(message);
 		this.name = 'SeekError';
