@@ -4,6 +4,7 @@ import { Readable } from 'stream';
 import fs from 'fs';
 import path from 'path';
 import prism from 'prism-media'; // Import prism-media
+import { exec } from 'child_process';
 
 // --- CONFIGURAÇÃO DE TESTE ---
 const TEST_DIR = path.resolve('./test');
@@ -74,6 +75,20 @@ function createWavHeader(dataLength, sampleRate, channels, bitDepth = 16) {
     buffer.write('data', 36);
     buffer.writeUInt32LE(dataLength, 40);
     return buffer;
+}
+
+async function validateFileWithFFmpeg(filePath) {
+  return new Promise((resolve, reject) => {
+    const command = `ffmpeg -v error -i "${filePath}" -f null -`;
+    exec(command, (error, stdout, stderr) => {
+      if (error) {
+        reject(new Error(`FFmpeg validation failed for ${filePath}: ${error.message}\n${stderr}`));
+      } else {
+        console.log(`  ✓ [FFmpeg] Validação de ${filePath} com sucesso.`);
+        resolve(true);
+      }
+    });
+  });
 }
 
 async function runTests() {
@@ -204,6 +219,7 @@ async function runTests() {
     assert.strictEqual(ebmlId, 0x1A45DFA3, `Buffer recebido do WebM range não começa com o ID EBML. Encontrado: 0x${ebmlId.toString(16)}`);
 
     fs.writeFileSync(path.join(TEST_DIR, 'test_range.webm'), receivedBuffer);
+    await validateFileWithFFmpeg(path.join(TEST_DIR, 'test_range.webm'));
     assert.ok(totalBytes > 0, 'Nenhum byte recebido para WebM range');
     console.log(`  ✓ [Sucesso] Stream WebM range validado com cabeçalho EBML (${totalBytes} bytes)`);
 
@@ -241,6 +257,7 @@ async function runTests() {
     const wavData = Buffer.concat([header, pcmData]);
 
     fs.writeFileSync(outputFilePath, wavData);
+    await validateFileWithFFmpeg(outputFilePath);
 
     const stats = fs.statSync(outputFilePath);
     assert.ok(stats.size > 44, 'Arquivo WAV gerado está vazio ou contém apenas o cabeçalho');

@@ -5,7 +5,7 @@
 ## Installation
 
 ```bash
-npm install seekable-stream
+npm install @ecliptia/seekable-stream
 ```
 
 ## Usage
@@ -18,7 +18,6 @@ Creates a seekable audio stream.
 -   `startTime` (number, optional): The desired start time in milliseconds. If omitted, the stream starts from the beginning.
 -   `endTime` (number, optional): The desired end time in milliseconds. If omitted or `0`, the stream goes until the end of the file.
 -   `httpHeaders` (object, optional): An object containing custom HTTP headers to be sent with requests. E.g., `{ 'Authorization': 'Bearer your_token' }`.
--   `customRequestFn` (function, optional): A custom function to handle HTTP requests. If provided, this function will be used instead of the internal HTTP request logic. It should accept `(url, options)` where `url` is a `URL` object and `options` is an object containing `method` (e.g., 'HEAD', 'GET') and `headers`. It must return a `Promise` that resolves to an `http.IncomingMessage` (for HEAD requests) or a `Readable` stream (for GET requests). For GET requests with a `Range` header, it should return a `Readable` stream. For GET requests without a `Range` header (e.g., for `fetchWithRange` to get `probeData`), it should return a `Promise<Buffer>`.
 
 Returns an object `{ stream: Readable, meta: object }`, where:
 -   `stream` is a Node.js `Readable` stream containing the audio data.
@@ -27,7 +26,7 @@ Returns an object `{ stream: Readable, meta: object }`, where:
 ### Example
 
 ```javascript
-import { seekableStream } from 'seekable-stream';
+import { seekableStream } from '@ecliptia/seekable-stream';
 import fs from 'fs';
 import http from 'http'; // Import http for customRequestFn example
 import https from 'https'; // Import https for customRequestFn example
@@ -36,21 +35,9 @@ async function main() {
     const url = 'https://www.example.com/audio.mp3';
     const localFilePath = 'file:///path/to/your/audio.flac';
 
-    // Custom request function example
-    const myCustomRequestFn = (url, options) => {
-        console.log(`Custom request for ${url.href} with method ${options.method}`);
-        // You can add custom logic here, e.g., proxy, authentication, etc.
-        return new Promise((resolve, reject) => {
-            const client = url.protocol === 'http:' ? http : https;
-            const req = client.request(url, options, (res) => resolve(res));
-            req.on('error', reject);
-            req.end();
-        });
-    };
-
     // Example 1: Full stream of an MP3 with custom headers and custom request function
     try {
-        const { stream, meta } = await seekableStream(url, undefined, undefined, { 'User-Agent': 'MyCustomPlayer/1.0' }, myCustomRequestFn);
+        const { stream, meta } = await seekableStream(url, undefined, undefined, { 'User-Agent': 'MyCustomPlayer/1.0' });
         console.log('MP3 stream meta:', meta);
         stream.pipe(fs.createWriteStream('output.mp3'));
         stream.on('end', () => console.log('Full MP3 saved.'));
