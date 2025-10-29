@@ -24,6 +24,7 @@
     "@alexanderolsen/libsamplerate-js": "^2.1.2",
     "@discordjs/opus": "^0.10.0",
     "@ecliptia/faad2-wasm": "^2.11.2-ecliptia.2",
+    "@sctg/libwebm-js": "^1.0.6",
     "@wasm-audio-decoders/flac": "^0.2.10",
     "@wasm-audio-decoders/ogg-vorbis": "^0.1.20",
     "codec-parser": "^2.5.0",

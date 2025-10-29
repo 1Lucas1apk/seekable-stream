@@ -3,6 +3,7 @@ import { seekableStream } from '../src/index.js';
 import { Readable } from 'stream';
 import fs from 'fs';
 import path from 'path';
+import prism from 'prism-media'; // Import prism-media
 
 // --- CONFIGURAÇÃO DE TESTE ---
 const TEST_DIR = path.resolve('./test');
@@ -54,6 +55,27 @@ const TEST_FILES = [
 ];
 
 // --- FUNÇÃO PRINCIPAL DE TESTE ---
+
+function createWavHeader(dataLength, sampleRate, channels, bitDepth = 16) {
+    const buffer = Buffer.alloc(44);
+    buffer.write('RIFF', 0);
+    buffer.writeUInt32LE(36 + dataLength, 4);
+    buffer.write('WAVE', 8);
+    buffer.write('fmt ', 12);
+    buffer.writeUInt32LE(16, 16);
+    buffer.writeUInt16LE(1, 20);
+    buffer.writeUInt16LE(channels, 22);
+    buffer.writeUInt32LE(sampleRate, 24);
+    const byteRate = sampleRate * channels * (bitDepth / 8);
+    buffer.writeUInt32LE(byteRate, 28);
+    const blockAlign = channels * (bitDepth / 8);
+    buffer.writeUInt16LE(blockAlign, 32);
+    buffer.writeUInt16LE(bitDepth, 34);
+    buffer.write('data', 36);
+    buffer.writeUInt32LE(dataLength, 40);
+    return buffer;
+}
+
 async function runTests() {
   console.log('Iniciando testes de integração para seekableStream...');
   let allTestsPassed = true;
@@ -187,6 +209,45 @@ async function runTests() {
 
   } catch (err) {
     console.error(`  ✗ [Falha] Teste para WebM com range:`, err.message);
+    allTestsPassed = false;
+  }
+
+  // --- NOVO TESTE: WebM para WAV com seek (range) usando prism-media ---
+  try {
+    console.log(`\n--- Testando WebM para WAV com seek (range) usando prism-media ---`);
+    const { stream, meta } = await seekableStream(TEST_FILES[3].url, 10000); // Start em 10s, fim do arquivo
+    assert.ok(stream instanceof Readable, 'Stream para WebM para WAV não é um Readable');
+    assert.ok(meta.webmHeaderPrepended === true, 'meta.webmHeaderPrepended deve ser true para WebM para WAV');
+    assert.ok(meta.resolvedRange.start === 0, 'Offset inicial para WebM para WAV deve ser 0 (cabeçalho prepended)');
+
+    const demuxer = new prism.opus.WebmDemuxer();
+    const decoder = new prism.opus.Decoder({ frameSize: 960, channels: 2, rate: 48000 }); // Assumindo Opus padrão
+
+    const outputFilePath = path.join(TEST_DIR, 'test_range.wav');
+    
+    const pcmChunks = [];
+    await new Promise((resolve, reject) => {
+        const pcmStream = stream.pipe(demuxer).pipe(decoder);
+        
+        pcmStream.on('data', chunk => pcmChunks.push(chunk));
+        pcmStream.on('end', resolve);
+        pcmStream.on('error', reject);
+        stream.on('error', reject);
+        demuxer.on('error', reject);
+    });
+
+    const pcmData = Buffer.concat(pcmChunks);
+    const header = createWavHeader(pcmData.length, 48000, 2, 16);
+    const wavData = Buffer.concat([header, pcmData]);
+
+    fs.writeFileSync(outputFilePath, wavData);
+
+    const stats = fs.statSync(outputFilePath);
+    assert.ok(stats.size > 44, 'Arquivo WAV gerado está vazio ou contém apenas o cabeçalho');
+    console.log(`  ✓ [Sucesso] WebM para WAV com seek (range) salvo em ${outputFilePath} (${stats.size} bytes)`);
+
+  } catch (err) {
+    console.error(`  ✗ [Falha] Teste para WebM para WAV com seek (range) usando prism-media:`, err.message);
     allTestsPassed = false;
   }
 
