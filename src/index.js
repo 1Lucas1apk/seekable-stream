@@ -18,24 +18,37 @@ export class SeekError extends Error {
 }
 
 async function makeHttpRequest(url, options, customRequestFn = null) {
-    
     if (customRequestFn) {
         return customRequestFn(url, options);
     }
 
-    const client = url.protocol === 'http:' ? http : https;
+    let currentUrl = new URL(url);
+    let redirectCount = 0;
+    const MAX_REDIRECTS = 10;
 
-    return new Promise((resolve, reject) => {
-        const req = client.request(url, options, (res) => {
-            resolve(res);
+    while (redirectCount <= MAX_REDIRECTS) {
+        const client = currentUrl.protocol === 'http:' ? http : https;
+
+        const res = await new Promise((resolve, reject) => {
+            const req = client.request(currentUrl, options, (res) => {
+                resolve(res);
+            });
+            req.on('error', (err) => {
+                reject(err);
+            });
+            req.end();
         });
-        
-        req.on('error', (err) => {
-            reject(err);
-        });
-        
-        req.end();
-    });
+
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+            res.resume();
+            currentUrl = new URL(res.headers.location, currentUrl.href);
+            redirectCount++;
+        } else {
+            return res;
+        }
+    }
+
+    throw new SeekError('TOO_MANY_REDIRECTS', 'Exceeded maximum number of redirects');
 }
 
 async function fetchWithRange(url, start, end, customHeaders = {}, customRequestFn = null, chunkSize = 512 * 1024) {
@@ -117,7 +130,7 @@ async function* generateHttpChunks(parsedUrl, start, end, customHeaders, customR
         const response = await makeHttpRequest(parsedUrl, { headers }, customRequestFn);
 
         if (response.statusCode === 416) {
-            break; // We've gone past the end
+            break;
         }
         
         if (response.statusCode !== 206) {
@@ -139,7 +152,7 @@ async function* generateHttpChunks(parsedUrl, start, end, customHeaders, customR
         }
         
         if (!hasData) {
-            break; // No more data from server
+            break;
         }
     }
 }
@@ -185,11 +198,11 @@ export async function seekableStream(urlString, startTime, endTime, httpHeaders 
     try { 
         parsedUrl = new URL(urlString); 
     } catch (error) { 
-        throw new SeekError('INVALID_URL', `URL inválida: ${urlString}`); 
+        throw new SeekError('INVALID_URL', `Invalid URL: ${urlString}`); 
     }
     
     if (!['http:', 'https:', 'file:'].includes(parsedUrl.protocol)) {
-        throw new SeekError('UNSUPPORTED_PROTOCOL', `Protocolo não suportado: ${parsedUrl.protocol}. Apenas http(s) e file:// são suportados.`);
+        throw new SeekError('UNSUPPORTED_PROTOCOL', `Unsupported protocol: ${parsedUrl.protocol}. Only http(s) and file:// are supported.`);
     }
 
     let contentLength = 0;
@@ -213,7 +226,7 @@ export async function seekableStream(urlString, startTime, endTime, httpHeaders 
             acceptRanges = 'bytes';
             
         } catch (error) {
-            throw new SeekError('FILE_ACCESS_ERROR', `Erro ao acessar arquivo local: ${parsedUrl.pathname}. ${error.message}`);
+            throw new SeekError('FILE_ACCESS_ERROR', `Error accessing local file: ${parsedUrl.pathname}. ${error.message}`);
         }
     } else {
         try {
@@ -253,7 +266,7 @@ export async function seekableStream(urlString, startTime, endTime, httpHeaders 
     meta.contentLength = contentLength;
     meta.acceptRanges = acceptRanges;
 
-    const PROBE_BYTES = 32 * 1024; // Reduzido para otimizar o tempo de início
+    const PROBE_BYTES = 32 * 1024;
     let probeData = Buffer.alloc(0);
 
     if (parsedUrl.protocol === 'file:') {
@@ -264,7 +277,7 @@ export async function seekableStream(urlString, startTime, endTime, httpHeaders 
             probeData = buffer.slice(0, bytesRead);
             await fileHandle.close();
         } catch (error) {
-            throw new SeekError('FILE_PROBE_ERROR', `Erro ao fazer probe do arquivo local: ${parsedUrl.pathname}. ${error.message}`);
+            throw new SeekError('FILE_PROBE_ERROR', `Error probing local file: ${parsedUrl.pathname}. ${error.message}`);
         }
     } else if (contentLength > 0 && acceptRanges === 'bytes') {
         try {
@@ -278,7 +291,6 @@ export async function seekableStream(urlString, startTime, endTime, httpHeaders 
 
     if (probeData.length > 0) {
         let isWebm = false;
-        // Verifica o magic number EBML para confirmar que é um WebM
         if (probeData.length >= 4 && probeData.readUInt32BE(0) === 0x1A45DFA3) {
             try {
                 const decoder = new Decoder();
@@ -397,16 +409,14 @@ export async function seekableStream(urlString, startTime, endTime, httpHeaders 
                 }
 
                 if (headerEndOffset === null) {
-                    throw new SeekError('WEBM_HEADER_PARSE_ERROR', `Não foi possível encontrar o fim do cabeçalho WebM (Cluster) nos ${probeData.length} bytes do probe inicial.`);
+                    throw new SeekError('WEBM_HEADER_PARSE_ERROR', `Could not find the end of the WebM header (Cluster) in the initial ${probeData.length} probe bytes.`);
                 }
                 
-                // Stream do cabeçalho
                 const headerStream = createHttpStream(parsedUrl, 0, headerEndOffset - 1, httpHeaders, customRequestFn);
                 for await (const chunk of headerStream) {
                     finalStream.write(chunk);
                 }
 
-                // Stream do fragmento, procurando pelo primeiro Cluster
                 const fragmentStream = createHttpStream(parsedUrl, startByte, endByte, httpHeaders, customRequestFn);
                 const magicCluster = Buffer.from([0x1f, 0x43, 0xb6, 0x75]);
                 let foundCluster = false;
@@ -427,7 +437,6 @@ export async function seekableStream(urlString, startTime, endTime, httpHeaders 
                         const validChunk = buffer.slice(index);
                         finalStream.write(validChunk);
                     } else {
-                        // Guarda os últimos bytes para o caso da assinatura mágica estar dividida entre os chunks
                         remainder = buffer.slice(Math.max(0, buffer.length - magicCluster.length + 1));
                     }
                 }
@@ -441,7 +450,6 @@ export async function seekableStream(urlString, startTime, endTime, httpHeaders 
 
         pipeMedia();
 
-        // Adjust meta and return immediately
         const fragmentLength = (endByte === Infinity || contentLength === 0) ? Infinity : (endByte - startByte + 1);
         let tempHeaderEndOffset = null;
         try {
