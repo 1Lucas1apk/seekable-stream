@@ -6,7 +6,7 @@ import path from 'path';
 import fs from 'fs';
 
 // --- CONFIGURAÇÃO DE TESTE ---
-const TEST_URL = 'https://raw.githubusercontent.com/LunaStream/QuickMedia/refs/heads/main/lab/sample/videoplayback.webm';
+const TEST_URL = 'http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4';
 const SEEK_TIME_MS = 30000; // 30 segundos
 const TEST_DIR = path.resolve('./test');
 
@@ -29,9 +29,10 @@ async function runFFmpegTest() {
         assert.ok(stream instanceof Readable, 'A saída de seekableStream não é um Readable stream.');
         log('  ✓ [Sucesso] seekableStream retornou um stream Readable.');
 
-        assert.strictEqual(meta.codec.container, 'webm', 'O container do codec não é webm.');
-        assert.ok(meta.webmHeaderPrepended, 'O cabeçalho WebM não foi pré-anexado para o seek.');
-        log('  ✓ [Sucesso] Metadados para o stream com seek estão corretos.');
+        // Atualizado para MP4 (Perfect Stream)
+        assert.ok(meta.contentType === 'audio/mp4' || meta.contentType === 'audio/aac', `ContentType incorreto: ${meta.contentType}`);
+        assert.ok(meta.mp4HeaderPrepended, 'O cabeçalho MP4 não foi pré-anexado para o seek.');
+        log('  ✓ [Sucesso] Metadados para o stream MP4 com seek estão corretos.');
 
         const ffmpegProcess = spawn('ffmpeg', [
             '-v', 'info',      // Nível de log para mais detalhes

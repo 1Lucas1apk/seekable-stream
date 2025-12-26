@@ -140,6 +140,11 @@ async function runTests() {
         stream.on('data', (chunk) => {
             totalBytes += chunk.length;
             receivedChunks.push(chunk);
+            // Otimização: Não precisamos baixar 100MB apenas para testar o formato
+            if (totalBytes > 100 * 1024) {
+                stream.destroy();
+                resolve();
+            }
         });
         stream.on('end', () => {
             console.log(`[DEBUG] Buffer.concat(receivedChunks) first chunk: ${Buffer.concat(receivedChunks).slice(0, 10).toString('hex')}`);
@@ -228,6 +233,35 @@ async function runTests() {
     allTestsPassed = false;
   }
 
+  // --- Teste de seek (range) para MP4 ---
+  try {
+    console.log(`\n--- Testando MP4 com seek (range) ---`);
+    const TEST_MP4_URL = 'http://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ElephantsDream.mp4';
+    // Alterado para 30s-45s para garantir que há áudio audível
+    const { stream, meta } = await seekableStream(TEST_MP4_URL, 30000, 45000);
+
+    assert.ok(stream instanceof Readable, 'Stream para MP4 range não é um Readable');
+    assert.ok(meta.resolvedRange.start === 0, 'Offset inicial para MP4 range deve ser 0 (headers prepended)');
+
+    let totalBytes = 0;
+    const outputFilePath = path.join(TEST_DIR, 'test_range.mp4');
+    const ws = fs.createWriteStream(outputFilePath);
+
+    await new Promise((resolve, reject) => {
+      stream.on('data', (chunk) => { totalBytes += chunk.length; ws.write(chunk); });
+      stream.on('end', () => { ws.end(); resolve(); });
+      stream.on('error', (err) => { ws.end(); reject(err); });
+      ws.on('error', reject);
+    });
+
+    assert.ok(totalBytes > 0, 'Nenhum byte recebido para MP4 range');
+    console.log(`  ✓ [Sucesso] Stream MP4 range salvo em ${outputFilePath} (${totalBytes} bytes)`);
+
+  } catch (err) {
+    console.error(`  ✗ [Falha] Teste para MP4 com range:`, err.message);
+    allTestsPassed = false;
+  }
+
   // --- NOVO TESTE: WebM para WAV com seek (range) usando prism-media ---
   try {
     console.log(`\n--- Testando WebM para WAV com seek (range) usando prism-media ---`);
@@ -237,7 +271,12 @@ async function runTests() {
     assert.ok(meta.resolvedRange.start === 0, 'Offset inicial para WebM para WAV deve ser 0 (cabeçalho prepended)');
 
     const demuxer = new prism.opus.WebmDemuxer();
-    const decoder = new prism.opus.Decoder({ frameSize: 960, channels: 2, rate: 48000 }); // Assumindo Opus padrão
+    let decoder;
+    try {
+        decoder = new prism.opus.Decoder({ frameSize: 960, channels: 2, rate: 48000 });
+    } catch (e) {
+        throw new Error(`Prism Opus Decoder falhou (provavelmente falta @discordjs/opus ou opusscript): ${e.message}`);
+    }
 
     const outputFilePath = path.join(TEST_DIR, 'test_range.wav');
     
