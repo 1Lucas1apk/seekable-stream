@@ -3,7 +3,7 @@ import { URL } from 'url';
 import http from 'http';
 import https from 'https';
 import fsPromises from 'fs/promises';
-import { createReadStream } from 'fs'; 
+import { createReadStream } from 'fs';
 import CodecParser from 'codec-parser';
 import { Decoder } from 'ts-ebml';
 
@@ -59,7 +59,7 @@ async function fetchWithRange(url, start, end, customHeaders = {}, customRequest
 
     const headers = { ...customHeaders, 'Range': `bytes=${start}-${end}` };
     const response = await makeHttpRequest(url, { headers }, customRequestFn);
-    
+
     if (response.statusCode === 416) {
         response.resume();
         return Buffer.alloc(0);
@@ -77,7 +77,7 @@ async function fetchWithRange(url, start, end, customHeaders = {}, customRequest
     for await (const chunk of response) {
         const remaining = targetLength - bytesRead;
         if (remaining <= 0 && targetLength !== Infinity) break;
-        
+
         if (targetLength !== Infinity && chunk.length > remaining) {
             allChunks.push(chunk.slice(0, remaining));
             bytesRead += remaining;
@@ -87,9 +87,9 @@ async function fetchWithRange(url, start, end, customHeaders = {}, customRequest
             bytesRead += chunk.length;
         }
     }
-    
+
     if (response.statusCode === 200) response.destroy();
-    
+
     return Buffer.concat(allChunks);
 }
 
@@ -102,21 +102,21 @@ async function* generateHttpChunks(parsedUrl, start, end, customHeaders, customR
     let currentPos = start;
 
     while (currentPos <= end || end === Infinity) {
-        
+
         const chunkEnd = (end === Infinity) ? currentPos + chunkSize - 1 : Math.min(currentPos + chunkSize - 1, end);
-        
+
         if (currentPos > chunkEnd && end !== Infinity) {
             break;
         }
-        
+
         const headers = { ...customHeaders, Range: `bytes=${currentPos}-${chunkEnd}` };
-        
+
         const response = await makeHttpRequest(parsedUrl, { headers }, customRequestFn);
 
         if (response.statusCode === 416) {
             break;
         }
-        
+
         if (response.statusCode !== 206) {
             if (response.statusCode === 200 && start === 0) {
                  for await (const chunk of response) {
@@ -124,17 +124,17 @@ async function* generateHttpChunks(parsedUrl, start, end, customHeaders, customR
                  }
                  break;
             }
-            break; 
+            break;
         }
 
         currentPos = chunkEnd + 1;
-        
+
         let hasData = false;
         for await (const chunk of response) {
             yield chunk;
             hasData = true;
         }
-        
+
         if (!hasData) {
             break;
         }
@@ -147,24 +147,39 @@ function createHttpStream(parsedUrl, start, end, customHeaders = {}, customReque
 
 function detectContentType(buffer, originalMime, urlString = '') {
     if (!buffer || buffer.length < 4) return originalMime;
-    
+
     const hex = buffer.toString('hex', 0, 4);
     const ascii = buffer.toString('ascii', 0, 4);
 
     if (ascii === 'fLaC') return 'audio/flac';
-    
-    if (buffer[0] === 0xFF && (buffer[1] & 0xF0) === 0xF0) return 'audio/aac';
+
+    // Detecção de MPEG Audio / AAC ADTS
+    // Ambos os formatos usam padrões de sincronização começando com 0xFF e bits superiores do byte 1 setados
+    // A diferença chave está nos "layer bits" (bits 1-2 do byte 1):
+    // - AAC ADTS: layer bits = 00 (valor 0)
+    // - MP3 Layer I: layer bits = 11 (valor 3)
+    // - MP3 Layer II: layer bits = 10 (valor 2)
+    // - MP3 Layer III: layer bits = 01 (valor 1)
+    if (buffer[0] === 0xFF && (buffer[1] & 0xE0) === 0xE0) {
+        const layerBits = (buffer[1] & 0x06) >> 1;  // Extrai bits 1-2
+        if (layerBits === 0) {
+            // Layer bits são 00 - isso é AAC ADTS
+            return 'audio/aac';
+        } else {
+            // Layer bits são diferentes de zero - isso é MPEG audio (MP3)
+            return 'audio/mpeg';
+        }
+    }
 
     if (hex.startsWith('494433')) {
         const ext = urlString.split('?')[0].split('.').pop().toLowerCase();
         if (ext === 'aac' || (originalMime && originalMime.includes('aac'))) return 'audio/aac';
-        return 'audio/mpeg'; 
+        return 'audio/mpeg';
     }
 
-    if (buffer[0] === 0xFF && (buffer[1] & 0xE0) === 0xE0) return 'audio/mpeg';
-    
+
     if (buffer.length >= 8 && buffer.slice(4, 8).toString('ascii') === 'ftyp') return 'audio/mp4';
-    
+
     if (!originalMime || originalMime === 'application/octet-stream') {
         const ext = urlString.split('?')[0].split('.').pop().toLowerCase();
         const mimeMap = {
@@ -185,7 +200,7 @@ function detectContentType(buffer, originalMime, urlString = '') {
 
 async function findMp4Headers(url, fileSize, httpHeaders, customRequestFn) {
     let offset = 0;
-    const MAX_HEADER_SIZE = 10 * 1024 * 1024; 
+    const MAX_HEADER_SIZE = 10 * 1024 * 1024;
     let iterations = 0;
     let ftyp = null;
     let moov = null;
@@ -199,7 +214,7 @@ async function findMp4Headers(url, fileSize, httpHeaders, customRequestFn) {
         const type = headerBuffer.toString('ascii', 4, 8);
         let headerSize = 8;
 
-        if (size === 1) { 
+        if (size === 1) {
             if (headerBuffer.length < 16) break;
             const high = headerBuffer.readUInt32BE(8);
             const low = headerBuffer.readUInt32BE(12);
@@ -287,7 +302,7 @@ function getMp4AudioSampleOffsetByTime(moovBuffer, targetTimeMs) {
                         const sttsIdx = stbl.indexOf('stts');
                         if (sttsIdx === -1) break;
                         const stts = readTable(stbl, sttsIdx, 'stts');
-                        
+
                         let currentSampleIdx = 0;
                         let currentTime = 0;
                         for (const entry of stts) {
@@ -304,7 +319,7 @@ function getMp4AudioSampleOffsetByTime(moovBuffer, targetTimeMs) {
                         const stscIdx = stbl.indexOf('stsc');
                         if (stscIdx === -1) break;
                         const stsc = readTable(stbl, stscIdx, 'stsc');
-                        
+
                         let chunkIdx = 1;
                         let samplesAcc = 0;
                         let foundChunk = false;
@@ -313,7 +328,7 @@ function getMp4AudioSampleOffsetByTime(moovBuffer, targetTimeMs) {
                             const entry = stsc[i];
                             const nextEntryChunk = (i + 1 < stsc.length) ? stsc[i+1].firstChunk : Infinity;
                             const numChunks = nextEntryChunk - entry.firstChunk;
-                            
+
                             const samplesInBlock = numChunks * entry.samplesPerChunk;
 
                             if (currentSampleIdx < samplesAcc + samplesInBlock) {
@@ -323,8 +338,8 @@ function getMp4AudioSampleOffsetByTime(moovBuffer, targetTimeMs) {
                                 foundChunk = true;
                                 break;
                             }
-                            
-                            samplesAcc += (numChunks === Infinity ? 0 : samplesInBlock); 
+
+                            samplesAcc += (numChunks === Infinity ? 0 : samplesInBlock);
                             if (numChunks === Infinity && !foundChunk) {
                                  const remainingSamples = currentSampleIdx - samplesAcc;
                                  const chunkOffset = Math.floor(remainingSamples / entry.samplesPerChunk);
@@ -339,7 +354,7 @@ function getMp4AudioSampleOffsetByTime(moovBuffer, targetTimeMs) {
                         let chunkOffsets;
                         if (stcoIdx !== -1) chunkOffsets = readTable(stbl, stcoIdx, 'stco');
                         else if (co64Idx !== -1) chunkOffsets = readTable(stbl, co64Idx, 'co64');
-                        
+
                         if (chunkOffsets && chunkOffsets[chunkIdx - 1]) {
                             return chunkOffsets[chunkIdx - 1];
                         }
@@ -362,9 +377,9 @@ function getMp4AudioSamples(moovBuffer) {
     while (pos <= moovBuffer.length - 8) {
         let size = moovBuffer.readUInt32BE(pos);
         const type = moovBuffer.toString('ascii', pos + 4, pos + 8);
-        
-        if (size < 8) break; 
-        if (pos + size > moovBuffer.length) break; 
+
+        if (size < 8) break;
+        if (pos + size > moovBuffer.length) break;
 
         if (type === 'trak') {
             const trakBuffer = moovBuffer.slice(pos + 8, pos + size);
@@ -376,10 +391,10 @@ function getMp4AudioSamples(moovBuffer) {
                     if (handler === 'soun') {
                         const stblIdx = trakBuffer.indexOf('stbl');
                         if (stblIdx !== -1) {
-                            const stbl = trakBuffer.slice(stblIdx + 8); 
-                            
+                            const stbl = trakBuffer.slice(stblIdx + 8);
+
                             const chunkOffsets = [];
-                            let stcoPos = stbl.indexOf('stco'); 
+                            let stcoPos = stbl.indexOf('stco');
                             if (stcoPos !== -1 && stcoPos + 16 <= stbl.length) {
                                 const count = stbl.readUInt32BE(stcoPos + 12);
                                 for (let i = 0; i < count; i++) {
@@ -435,17 +450,17 @@ function getMp4AudioSamples(moovBuffer) {
                             for (let i = 0; i < chunkOffsets.length; i++) {
                                 const chunkIdx = i + 1;
                                 const offset = chunkOffsets[i];
-                                
+
                                 let entry = stscEntries[0];
                                 for (let k = 0; k < stscEntries.length; k++) {
                                     if (chunkIdx >= stscEntries[k].firstChunk) {
                                         entry = stscEntries[k];
                                     } else {
-                                        break; 
+                                        break;
                                     }
                                 }
 
-                                if (entry) { 
+                                if (entry) {
                                     let currentOffsetInChunk = 0;
                                     for (let j = 0; j < entry.samplesPerChunk; j++) {
                                         if (currentSampleIdx < sampleSizes.length) {
@@ -491,7 +506,7 @@ function patchAndFreeMp4(buffer, delta, durationMs, globalTimescale) {
             const version = buffer.readUInt8(pos + 8);
             const timescale = buffer.readUInt32BE(pos + (version === 1 ? 28 : 20));
             const newDur = Math.max(0, Math.floor((durationMs / 1000) * timescale));
-            
+
             if (version === 1) {
                 buffer.writeUInt32BE(Math.floor(newDur / 4294967296), pos + 32);
                 buffer.writeUInt32BE(newDur % 4294967296, pos + 36);
@@ -502,7 +517,7 @@ function patchAndFreeMp4(buffer, delta, durationMs, globalTimescale) {
             const version = buffer.readUInt8(pos + 8);
             const durationOffset = pos + (version === 1 ? 36 : 28);
             const newDur = Math.max(0, Math.floor((durationMs / 1000) * globalTimescale));
-            
+
             if (version === 1) {
                 buffer.writeUInt32BE(Math.floor(newDur / 4294967296), durationOffset);
                 buffer.writeUInt32BE(newDur % 4294967296, durationOffset + 4);
@@ -520,7 +535,7 @@ function patchAndFreeMp4(buffer, delta, durationMs, globalTimescale) {
                     if (handlerType === 'soun') isAudio = true;
                 }
             }
-            
+
             if (!isAudio) {
                 buffer.write('free', pos + 4);
             } else {
@@ -556,17 +571,17 @@ function parseMoovDuration(buffer) {
         const version = buffer.readUInt8(mvhdIndex + 4);
         const timescaleOffset = mvhdIndex + (version === 1 ? 24 : 16);
         const timescale = buffer.readUInt32BE(timescaleOffset);
-        
-        const duration = version === 1 
+
+        const duration = version === 1
             ? (buffer.readUInt32BE(timescaleOffset + 4) * 4294967296 + buffer.readUInt32BE(timescaleOffset + 8))
             : buffer.readUInt32BE(timescaleOffset + 4);
-            
+
         return { durationMs: (duration / timescale) * 1000, timescale };
     } catch (e) { return null; }
 }
 
 export function estimateBitrate(contentLength, durationMs, contentType) {
-    
+
     if (contentLength > 0 && durationMs > 0) {
         const bitrateBps = (contentLength * 8 * 1000) / durationMs;
         const bitrateKbps = bitrateBps / 1000;
@@ -582,7 +597,7 @@ export function estimateBitrate(contentLength, durationMs, contentType) {
         'application/ogg': 160,
         'audio/vorbis': 160,
         'audio/opus': 96,
-        'audio/mp4': 128, 
+        'audio/mp4': 128,
         'video/mp4': 128,
         'default': 128
     };
@@ -592,21 +607,21 @@ export function estimateBitrate(contentLength, durationMs, contentType) {
             return defaultBitrates[type];
         }
     }
-    
+
     return defaultBitrates.default;
 }
 
 export async function seekableStream(urlString, startTime, endTime, httpHeaders = {}, customRequestFn = null) {
-    
+
     const meta = { warnings: [] };
     let parsedUrl;
-    
-    try { 
-        parsedUrl = new URL(urlString); 
-    } catch (error) { 
-        throw new SeekError('INVALID_URL', `Invalid URL: ${urlString}`); 
+
+    try {
+        parsedUrl = new URL(urlString);
+    } catch (error) {
+        throw new SeekError('INVALID_URL', `Invalid URL: ${urlString}`);
     }
-    
+
     if (!['http:', 'https:', 'file:'].includes(parsedUrl.protocol)) {
         throw new SeekError('UNSUPPORTED_PROTOCOL', `Unsupported protocol: ${parsedUrl.protocol}. Only http(s) and file:// are supported.`);
     }
@@ -618,7 +633,7 @@ export async function seekableStream(urlString, startTime, endTime, httpHeaders 
     if (parsedUrl.protocol === 'file:') {
         try {
             const stats = await fsPromises.stat(parsedUrl.pathname);
-            
+
             contentLength = stats.size;
             const extension = parsedUrl.pathname.split('.').pop().toLowerCase();
             const mimeTypes = {
@@ -632,14 +647,14 @@ export async function seekableStream(urlString, startTime, endTime, httpHeaders 
             };
             contentType = mimeTypes[extension] || 'application/octet-stream';
             acceptRanges = 'bytes';
-            
+
         } catch (error) {
             throw new SeekError('FILE_ACCESS_ERROR', `Error accessing local file: ${parsedUrl.pathname}. ${error.message}`);
         }
     } else {
         try {
             const response = await makeHttpRequest(parsedUrl, { method: 'HEAD', headers: httpHeaders }, customRequestFn);
-            
+
             if (response.statusCode >= 400) {
                  meta.warnings.push(`HEAD error ${response.statusCode}, trying blind probe.`);
             } else {
@@ -647,7 +662,7 @@ export async function seekableStream(urlString, startTime, endTime, httpHeaders 
                 contentType = response.headers['content-type'] || contentType;
                 acceptRanges = response.headers['accept-ranges'] || acceptRanges;
             }
-            response.resume(); 
+            response.resume();
 
         } catch (error) {
             meta.warnings.push(`Could not retrieve HEAD metadata for ${urlString}. Error: ${error.message}`);
@@ -677,14 +692,14 @@ export async function seekableStream(urlString, startTime, endTime, httpHeaders 
     }
 
     contentType = detectContentType(probeData, contentType, urlString);
-    
+
     meta.contentType = contentType;
     meta.contentLength = contentLength;
     meta.acceptRanges = acceptRanges;
 
     let isMp4 = contentType.includes('mp4') || contentType.includes('m4a');
     let mp4Atoms = null;
-    
+
     if (isMp4 && contentLength > 0) {
         try {
             mp4Atoms = await findMp4Headers(parsedUrl, contentLength, httpHeaders, customRequestFn);
@@ -718,7 +733,7 @@ export async function seekableStream(urlString, startTime, endTime, httpHeaders 
                     const duration = durationEl.value;
                     const timecodeScale = (timecodeScaleEl && timecodeScaleEl.type !== 'm') ? timecodeScaleEl.value : 1000000;
                     const codecId = (codecIdEl && codecIdEl.type !== 'm') ? codecIdEl.value : null;
-                    
+
                     meta.durationMs = duration * (timecodeScale / 1000000);
 
                     let container = 'webm';
@@ -730,7 +745,7 @@ export async function seekableStream(urlString, startTime, endTime, httpHeaders 
                     } else if (codecId) {
                         mime = `audio/webm; codecs=${codecId.toLowerCase()}`;
                     }
-                    
+
                     meta.contentType = mime;
                     meta.codec = {
                         container,
@@ -770,7 +785,7 @@ export async function seekableStream(urlString, startTime, endTime, httpHeaders 
     let startByte = 0;
     let endByte = contentLength > 0 ? contentLength - 1 : Infinity;
     let effectiveDurationMs = meta.durationMs;
-    
+
     if (!effectiveDurationMs && meta.contentLength > 0) {
         const estimatedBitrateKbps = estimateBitrate(meta.contentLength, 0, meta.contentType);
         effectiveDurationMs = (meta.contentLength * 8) / (estimatedBitrateKbps * 1000) * 1000;
@@ -826,16 +841,16 @@ export async function seekableStream(urlString, startTime, endTime, httpHeaders 
 
                 const headerSize = (mp4Atoms.ftyp ? mp4Atoms.ftyp.length : 0) + mp4Atoms.moov.length + 8;
                 const delta = headerSize - alignedStartByte;
-                
+
                 const clipDurationMs = (endTime && endTime !== Infinity ? endTime : meta.durationMs) - (startTime || 0);
                 const globalTimescale = meta.timescale || 1000;
                 patchAndFreeMp4(mp4Atoms.moov, delta, clipDurationMs, globalTimescale);
 
                 if (mp4Atoms.ftyp) finalStream.write(mp4Atoms.ftyp);
                 finalStream.write(mp4Atoms.moov);
-                
+
                 const mdatHeader = Buffer.alloc(8);
-                mdatHeader.writeUInt32BE(0, 0); 
+                mdatHeader.writeUInt32BE(0, 0);
                 mdatHeader.write('mdat', 4);
                 finalStream.write(mdatHeader);
 
@@ -850,7 +865,7 @@ export async function seekableStream(urlString, startTime, endTime, httpHeaders 
 
         meta.mp4HeaderPrepended = true;
         meta.originalSeekRange = { start: startByte, end: endByte };
-        meta.resolvedRange = { start: 0, end: Infinity }; 
+        meta.resolvedRange = { start: 0, end: Infinity };
         return { stream: finalStream, meta };
     }
 
@@ -874,7 +889,7 @@ export async function seekableStream(urlString, startTime, endTime, httpHeaders 
                     rawStream.pipe(finalStream);
                     return;
                 }
-                
+
                 const headerStream = createHttpStream(parsedUrl, 0, headerEndOffset - 1, httpHeaders, customRequestFn);
                 for await (const chunk of headerStream) {
                     finalStream.write(chunk);
@@ -928,7 +943,7 @@ export async function seekableStream(urlString, startTime, endTime, httpHeaders 
         meta.resolvedRange = { start: 0, end: meta.contentLength ? meta.contentLength - 1 : Infinity };
         meta.webmHeaderPrepended = true;
         meta.originalSeekRange = { start: startByte, end: endByte };
-        
+
         return { stream: finalStream, meta };
     }
 
