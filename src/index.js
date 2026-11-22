@@ -7,6 +7,103 @@ import { createReadStream } from 'fs';
 import CodecParser from 'codec-parser';
 import { Decoder } from 'ts-ebml';
 
+// WebM seek metadata is immutable for a given media URL. Reuse the parsed
+// header, Cues index and header prefix across repeated seeks in the same node.
+const WEBM_SEEK_CACHE = new Map();
+const WEBM_HEAD_INFLIGHT = new Map();
+const WEBM_PROBE_INFLIGHT = new Map();
+const WEBM_CUE_INDEX_INFLIGHT = new Map();
+const WEBM_HEADER_PREFIX_INFLIGHT = new Map();
+const WEBM_SEEK_CACHE_TTL_MS = 5 * 60 * 1000;
+const WEBM_SEEK_CACHE_MAX_ENTRIES = 32;
+const WEBM_HEADER_PREFIX_CACHE_MAX_BYTES = 2 * 1024 * 1024;
+const WEBM_SEEK_PREWARM_TAIL_BYTES = 512 * 1024;
+const WEBM_SEEK_PREWARM_ENABLED = process.env.NODELINK_WEBM_SEEK_PREWARM !== 'false';
+
+function getOrCreateSharedPromise(map, key, loader) {
+    const existing = map.get(key);
+    if (existing) return existing;
+
+    const promise = Promise.resolve().then(loader);
+    map.set(key, promise);
+    const cleanup = () => {
+        if (map.get(key) === promise) map.delete(key);
+    };
+    promise.then(cleanup, cleanup);
+    return promise;
+}
+
+function createWebmSeekCacheKey(url, headers = {}) {
+    const normalizedHeaders = Object.entries(headers || {})
+        .filter(([name]) => name.toLowerCase() !== 'range')
+        .map(([name, value]) => [name.toLowerCase(), String(value)])
+        .sort(([a], [b]) => a.localeCompare(b));
+    return `${url.toString()}\\n${JSON.stringify(normalizedHeaders)}`;
+}
+
+function getWebmSeekCache(key) {
+    if (!key) return null;
+    const entry = WEBM_SEEK_CACHE.get(key);
+    if (!entry) return null;
+    if (entry.expiresAt <= Date.now()) {
+        WEBM_SEEK_CACHE.delete(key);
+        return null;
+    }
+    WEBM_SEEK_CACHE.delete(key);
+    entry.expiresAt = Date.now() + WEBM_SEEK_CACHE_TTL_MS;
+    WEBM_SEEK_CACHE.set(key, entry);
+    return entry;
+}
+
+function setWebmSeekCache(key, entry) {
+    if (!key || !entry) return entry;
+    entry.expiresAt = Date.now() + WEBM_SEEK_CACHE_TTL_MS;
+    WEBM_SEEK_CACHE.delete(key);
+    WEBM_SEEK_CACHE.set(key, entry);
+    while (WEBM_SEEK_CACHE.size > WEBM_SEEK_CACHE_MAX_ENTRIES) {
+        const oldestKey = WEBM_SEEK_CACHE.keys().next().value;
+        if (oldestKey === undefined) break;
+        WEBM_SEEK_CACHE.delete(oldestKey);
+    }
+    return entry;
+}
+
+async function getWebmHeaderPrefix(parsedUrl, headerEndOffset, customHeaders, customRequestFn, cacheEntry, cacheKey) {
+    if (cacheEntry?.prefixBuffer) return cacheEntry.prefixBuffer;
+    if (headerEndOffset <= 0 || headerEndOffset > WEBM_HEADER_PREFIX_CACHE_MAX_BYTES) return null;
+
+    if (cacheEntry?.prefixPromise) return cacheEntry.prefixPromise;
+
+    const request = getOrCreateSharedPromise(
+        WEBM_HEADER_PREFIX_INFLIGHT,
+        cacheKey || parsedUrl.toString(),
+        () => fetchWithRange(
+            parsedUrl,
+            0,
+            headerEndOffset - 1,
+            customHeaders,
+            customRequestFn
+        )
+    ).then((buffer) => {
+        if (buffer.length !== headerEndOffset) {
+            throw new SeekError(
+                'INCOMPLETE_WEBM_HEADER',
+                `WebM header prefix returned ${buffer.length} bytes; expected ${headerEndOffset}`
+            );
+        }
+        if (cacheEntry) cacheEntry.prefixBuffer = buffer;
+        return buffer;
+    }).catch((error) => {
+        if (cacheEntry) cacheEntry.prefixPromise = null;
+        throw error;
+    }).finally(() => {
+        if (cacheEntry) cacheEntry.prefixPromise = null;
+    });
+
+    if (cacheEntry) cacheEntry.prefixPromise = request;
+    return request;
+}
+
 export class SeekError extends Error {
     constructor(code, message, hint = '', traceId = '', resolvedRanges = []) {
         super(message);
@@ -51,46 +148,106 @@ async function makeHttpRequest(url, options, customRequestFn = null) {
     throw new SeekError('TOO_MANY_REDIRECTS', 'Exceeded maximum number of redirects');
 }
 
-async function fetchWithRange(url, start, end, customHeaders = {}, customRequestFn = null, chunkSize = 512 * 1024) {
-
-    if (start > end && end !== Infinity) {
+async function fetchWithRange(url, start, end, customHeaders = {}, customRequestFn = null) {
+    if (start < 0 || (end !== Infinity && end < start)) {
         return Buffer.alloc(0);
     }
 
-    const headers = { ...customHeaders, 'Range': `bytes=${start}-${end}` };
+    const headers = { ...customHeaders, Range: `bytes=${start}-${end}` };
     const response = await makeHttpRequest(url, { headers }, customRequestFn);
+    const statusCode = response.statusCode;
 
-    if (response.statusCode === 416) {
+    if (statusCode === 416) {
         response.resume();
         return Buffer.alloc(0);
     }
 
-    if (response.statusCode !== 206 && response.statusCode !== 200) {
+    if (statusCode !== 206 && statusCode !== 200) {
         response.resume();
-        throw new SeekError('UNEXPECTED_HTTP_STATUS', `Unexpected status: ${response.statusCode}`);
+        throw new SeekError(
+            'UNEXPECTED_HTTP_STATUS',
+            `Unexpected status: ${statusCode}`
+        );
+    }
+
+    let expectedLength = Infinity;
+    if (statusCode === 206) {
+        const contentRange = String(
+            response.headers?.['content-range'] ?? response.headers?.['Content-Range'] ?? ''
+        );
+        const match = /^bytes (\d+)-(\d+)\/(\d+|\*)$/i.exec(contentRange);
+        if (!match) {
+            response.resume();
+            throw new SeekError('INVALID_CONTENT_RANGE', 'Missing or invalid Content-Range header');
+        }
+
+        const rangeStart = Number(match[1]);
+        const rangeEnd = Number(match[2]);
+        if (
+            rangeStart !== start ||
+            !Number.isSafeInteger(rangeEnd) ||
+            rangeEnd < rangeStart ||
+            (end !== Infinity && rangeEnd > end)
+        ) {
+            response.resume();
+            throw new SeekError(
+                'INVALID_CONTENT_RANGE',
+                `Unexpected Content-Range: ${contentRange}; requested ${start}-${end}`
+            );
+        }
+
+        expectedLength = rangeEnd - rangeStart + 1;
+        const contentLength = Number(response.headers?.['content-length']);
+        if (Number.isFinite(contentLength) && contentLength !== expectedLength) {
+            response.resume();
+            throw new SeekError('INVALID_CONTENT_LENGTH', 'Content-Length does not match Content-Range');
+        }
+    } else {
+        if (start !== 0) {
+            response.resume();
+            throw new SeekError(
+                'RANGE_NOT_SUPPORTED',
+                'The server ignored a non-zero HTTP Range request'
+            );
+        }
+        expectedLength = end === Infinity ? Infinity : end + 1;
     }
 
     const allChunks = [];
     let bytesRead = 0;
-    const targetLength = (end === Infinity) ? Infinity : (end - start + 1);
+    try {
+        for await (const chunkValue of response) {
+            const chunk = Buffer.isBuffer(chunkValue) ? chunkValue : Buffer.from(chunkValue);
+            const remaining = expectedLength - bytesRead;
+            if (remaining <= 0) break;
 
-    for await (const chunk of response) {
-        const remaining = targetLength - bytesRead;
-        if (remaining <= 0 && targetLength !== Infinity) break;
+            if (Number.isFinite(remaining) && chunk.length > remaining) {
+                allChunks.push(chunk.subarray(0, remaining));
+                bytesRead += remaining;
+                break;
+            }
 
-        if (targetLength !== Infinity && chunk.length > remaining) {
-            allChunks.push(chunk.slice(0, remaining));
-            bytesRead += remaining;
-            break;
-        } else {
             allChunks.push(chunk);
             bytesRead += chunk.length;
         }
+    } finally {
+        if (statusCode === 200 || (Number.isFinite(expectedLength) && bytesRead >= expectedLength)) {
+            response.destroy();
+        }
     }
 
-    if (response.statusCode === 200) response.destroy();
+    if (
+        statusCode === 206 &&
+        Number.isFinite(expectedLength) &&
+        bytesRead !== expectedLength
+    ) {
+        throw new SeekError(
+            'INCOMPLETE_RANGE',
+            `HTTP Range returned ${bytesRead} bytes; expected ${expectedLength}`
+        );
+    }
 
-    return Buffer.concat(allChunks);
+    return Buffer.concat(allChunks, bytesRead);
 }
 
 function createLocalFileStream(filePath, start, end) {
@@ -98,51 +255,780 @@ function createLocalFileStream(filePath, start, end) {
     return stream;
 }
 
+const RANGE_RETRYABLE_CODES = new Set([
+    'ETIMEDOUT',
+    'ECONNRESET',
+    'EPIPE',
+    'ENETUNREACH',
+    'EHOSTUNREACH',
+    'ECONNREFUSED'
+]);
+const MAX_RANGE_STREAM_RETRIES = 3;
+
+function getErrorCode(error) {
+    return String(error?.code ?? error?.cause?.code ?? '');
+}
+
+function isRetryableRangeError(error) {
+    if (!error || error.name === 'AbortError' || getErrorCode(error) === 'ABORT_ERR') {
+        return false;
+    }
+    return RANGE_RETRYABLE_CODES.has(getErrorCode(error));
+}
+
+function waitForRangeRetry(attempt) {
+    const delay = Math.min(200 * 2 ** (attempt - 1), 2000);
+    return new Promise((resolve) => setTimeout(resolve, delay));
+}
+
+function createRangeStreamError(error, start, end, received, expected) {
+    const code = getErrorCode(error);
+    const detail = error?.message || error?.cause?.message || String(error || 'Unknown stream error');
+    const suffix = code ? ` (${code})` : '';
+    const wrapped = new SeekError(
+        'RANGE_STREAM_INTERRUPTED',
+        `HTTP Range ${start}-${end} interrupted after ${received}/${expected} bytes${suffix}: ${detail}`
+    );
+    wrapped.cause = error;
+    return wrapped;
+}
+
 async function* generateHttpChunks(parsedUrl, start, end, customHeaders, customRequestFn, chunkSize) {
     let currentPos = start;
+    let knownTotal = null;
 
     while (currentPos <= end || end === Infinity) {
+        const chunkEnd = end === Infinity
+            ? currentPos + chunkSize - 1
+            : Math.min(currentPos + chunkSize - 1, end);
 
-        const chunkEnd = (end === Infinity) ? currentPos + chunkSize - 1 : Math.min(currentPos + chunkSize - 1, end);
+        if (currentPos > chunkEnd) break;
 
-        if (currentPos > chunkEnd && end !== Infinity) {
-            break;
-        }
+        let retries = 0;
+        let chunkCompleted = false;
 
-        const headers = { ...customHeaders, Range: `bytes=${currentPos}-${chunkEnd}` };
+        while (!chunkCompleted) {
+            const requestStart = currentPos;
+            const headers = {
+                ...customHeaders,
+                Range: `bytes=${requestStart}-${chunkEnd}`
+            };
 
-        const response = await makeHttpRequest(parsedUrl, { headers }, customRequestFn);
-
-        if (response.statusCode === 416) {
-            break;
-        }
-
-        if (response.statusCode !== 206) {
-            if (response.statusCode === 200 && start === 0) {
-                 for await (const chunk of response) {
-                     yield chunk;
-                 }
-                 break;
+            let response;
+            try {
+                response = await makeHttpRequest(parsedUrl, { headers }, customRequestFn);
+            } catch (error) {
+                if (isRetryableRangeError(error) && retries < MAX_RANGE_STREAM_RETRIES) {
+                    retries++;
+                    await waitForRangeRetry(retries);
+                    continue;
+                }
+                throw createRangeStreamError(error, requestStart, chunkEnd, 0, chunkEnd - requestStart + 1);
             }
-            break;
-        }
 
-        currentPos = chunkEnd + 1;
+            if (response.statusCode === 416) {
+                const contentRange = String(
+                    response.headers?.['content-range'] ?? response.headers?.['Content-Range'] ?? ''
+                );
+                response.resume();
+                const unsatisfied = /^bytes \*\/(\d+)$/i.exec(contentRange);
+                const total = unsatisfied ? Number(unsatisfied[1]) : null;
+                if (total !== null && requestStart >= total) return;
+                throw new SeekError(
+                    'RANGE_NOT_SATISFIABLE',
+                    `HTTP Range ${requestStart}-${chunkEnd} was rejected before EOF`
+                );
+            }
 
-        let hasData = false;
-        for await (const chunk of response) {
-            yield chunk;
-            hasData = true;
-        }
+            if (response.statusCode === 200) {
+                if (requestStart !== 0) {
+                    response.resume();
+                    throw new SeekError(
+                        'RANGE_NOT_SUPPORTED',
+                        'The server ignored a non-zero HTTP Range request'
+                    );
+                }
 
-        if (!hasData) {
-            break;
+                // A 200 response means the origin ignored Range. Do not retry
+                // after yielding bytes, because restarting would duplicate data.
+                let bytesRead = 0;
+                const maxBytes = end === Infinity ? Infinity : end + 1;
+                try {
+                    for await (const chunkValue of response) {
+                        const chunk = Buffer.isBuffer(chunkValue) ? chunkValue : Buffer.from(chunkValue);
+                        const remaining = maxBytes - bytesRead;
+                        if (remaining <= 0) break;
+                        const output = Number.isFinite(remaining)
+                            ? chunk.subarray(0, remaining)
+                            : chunk;
+                        if (output.length) yield output;
+                        bytesRead += output.length;
+                        if (output.length !== chunk.length || bytesRead >= maxBytes) break;
+                    }
+                } catch (error) {
+                    response.destroy?.();
+                    throw createRangeStreamError(error, 0, end, bytesRead, maxBytes);
+                } finally {
+                    response.destroy?.();
+                }
+
+                if (response.complete === false && bytesRead < maxBytes) {
+                    throw new SeekError(
+                        'INCOMPLETE_RESPONSE',
+                        `Full-response fallback was interrupted after ${bytesRead} bytes`
+                    );
+                }
+                return;
+            }
+
+            if (response.statusCode !== 206) {
+                response.resume();
+                throw new SeekError(
+                    'UNEXPECTED_HTTP_STATUS',
+                    `Unexpected status: ${response.statusCode}`
+                );
+            }
+
+            const contentRange = String(
+                response.headers?.['content-range'] ?? response.headers?.['Content-Range'] ?? ''
+            );
+            const match = /^bytes (\d+)-(\d+)\/(\d+|\*)$/i.exec(contentRange);
+            if (!match) {
+                response.resume();
+                throw new SeekError('INVALID_CONTENT_RANGE', 'Missing or invalid Content-Range header');
+            }
+
+            const rangeStart = Number(match[1]);
+            const rangeEnd = Number(match[2]);
+            const total = match[3] === '*' ? null : Number(match[3]);
+            if (
+                rangeStart !== requestStart ||
+                !Number.isSafeInteger(rangeEnd) ||
+                rangeEnd < rangeStart ||
+                rangeEnd > chunkEnd ||
+                (total !== null && (!Number.isSafeInteger(total) || total <= rangeEnd))
+            ) {
+                response.resume();
+                throw new SeekError(
+                    'INVALID_CONTENT_RANGE',
+                    `Unexpected Content-Range: ${contentRange}; requested ${requestStart}-${chunkEnd}`
+                );
+            }
+            if (knownTotal !== null && total !== null && knownTotal !== total) {
+                response.resume();
+                throw new SeekError('RESOURCE_CHANGED', 'HTTP resource size changed during streaming');
+            }
+            if (total !== null) knownTotal = total;
+
+            const expectedBytes = rangeEnd - rangeStart + 1;
+            const contentLength = Number(response.headers?.['content-length']);
+            if (Number.isFinite(contentLength) && contentLength !== expectedBytes) {
+                response.resume();
+                throw new SeekError('INVALID_CONTENT_LENGTH', 'Content-Length does not match Content-Range');
+            }
+
+            let bytesRead = 0;
+            try {
+                for await (const chunkValue of response) {
+                    const chunk = Buffer.isBuffer(chunkValue) ? chunkValue : Buffer.from(chunkValue);
+                    if (bytesRead + chunk.length > expectedBytes) {
+                        const remaining = expectedBytes - bytesRead;
+                        if (remaining > 0) {
+                            yield chunk.subarray(0, remaining);
+                            bytesRead += remaining;
+                        }
+                        throw new SeekError('OVERSIZED_RANGE', 'HTTP Range response exceeded Content-Range');
+                    }
+                    if (chunk.length) yield chunk;
+                    bytesRead += chunk.length;
+                }
+            } catch (error) {
+                response.destroy?.();
+
+                if (error?.code === 'OVERSIZED_RANGE') {
+                    throw error;
+                }
+
+                // The bytes already yielded are valid. Resume at the first byte
+                // not delivered, so a retry cannot duplicate or skip media data.
+                if (bytesRead === expectedBytes) {
+                    currentPos = rangeEnd + 1;
+                    retries = 0;
+                    chunkCompleted = currentPos > chunkEnd;
+                    continue;
+                }
+
+                currentPos = requestStart + bytesRead;
+                if (isRetryableRangeError(error) && retries < MAX_RANGE_STREAM_RETRIES) {
+                    retries++;
+                    await waitForRangeRetry(retries);
+                    continue;
+                }
+                throw createRangeStreamError(error, requestStart, rangeEnd, bytesRead, expectedBytes);
+            }
+
+            if (bytesRead !== expectedBytes) {
+                currentPos = requestStart + bytesRead;
+                const incomplete = new SeekError(
+                    'INCOMPLETE_RANGE',
+                    `HTTP Range returned ${bytesRead} bytes; expected ${expectedBytes}`
+                );
+                if (retries < MAX_RANGE_STREAM_RETRIES) {
+                    retries++;
+                    await waitForRangeRetry(retries);
+                    continue;
+                }
+                throw incomplete;
+            }
+
+            currentPos = rangeEnd + 1;
+            retries = 0;
+            chunkCompleted = currentPos > chunkEnd;
+            if (knownTotal !== null && currentPos >= knownTotal) return;
+            if (end !== Infinity && currentPos > end) return;
         }
     }
 }
 
 function createHttpStream(parsedUrl, start, end, customHeaders = {}, customRequestFn = null, chunkSize = 256 * 1024) {
     return Readable.from(generateHttpChunks(parsedUrl, start, end, customHeaders, customRequestFn, chunkSize));
+}
+
+const readEbmlVint = (buffer, offset, removeMarker = true) => {
+    if (offset < 0 || offset >= buffer.length) return null;
+    const first = buffer[offset];
+    if (!first) return null;
+
+    let mask = 0x80;
+    let length = 1;
+    while (length <= 8 && (first & mask) === 0) {
+        mask >>= 1;
+        length++;
+    }
+    if (length > 8 || offset + length > buffer.length) return null;
+
+    let value = BigInt(first);
+    for (let index = 1; index < length; index++) {
+        value = (value << 8n) | BigInt(buffer[offset + index]);
+    }
+    if (removeMarker) {
+        value &= (1n << BigInt(7 * length)) - 1n;
+    }
+    return { value, length };
+};
+
+const readEbmlElement = (buffer, offset) => {
+    const id = readEbmlVint(buffer, offset, false);
+    if (!id) return null;
+    const size = readEbmlVint(buffer, offset + id.length, true);
+    if (!size) return null;
+
+    const sizeLength = size.length;
+    const dataStart = offset + id.length + sizeLength;
+    const unknownSize = size.value === (1n << BigInt(7 * sizeLength)) - 1n;
+    if (unknownSize) {
+        return {
+            id: buffer.subarray(offset, offset + id.length).toString('hex'),
+            start: offset,
+            dataStart,
+            dataEnd: buffer.length,
+            nextOffset: buffer.length,
+            unknownSize: true
+        };
+    }
+    if (size.value > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+
+    const dataEnd = dataStart + Number(size.value);
+    return {
+        id: buffer.subarray(offset, offset + id.length).toString('hex'),
+        start: offset,
+        dataStart,
+        dataEnd,
+        nextOffset: dataEnd,
+        unknownSize: false
+    };
+};
+
+const readEbmlUint = (buffer, start, end) => {
+    let value = 0n;
+    for (let index = start; index < end; index++) {
+        value = (value << 8n) | BigInt(buffer[index]);
+    }
+    return value;
+};
+
+const getWebmHeaderInfo = (probeData) => {
+    const ebmlHeader = readEbmlElement(probeData, 0);
+    if (!ebmlHeader || ebmlHeader.id !== '1a45dfa3') return null;
+
+    const segment = readEbmlElement(probeData, ebmlHeader.nextOffset);
+    if (!segment || segment.id !== '18538067') return null;
+
+    const info = {
+        segmentDataOffset: segment.dataStart,
+        firstClusterOffset: null,
+        timecodeScaleNs: 1000000n,
+        durationMs: null,
+        audioDurationMs: null,
+        audioTrackNumber: null,
+        codecId: null,
+        codecDelayNs: 0n,
+        seekPreRollNs: 80000000n
+    };
+
+    const segmentEnd = Math.min(probeData.length, segment.dataEnd);
+    for (let offset = segment.dataStart; offset < segmentEnd;) {
+        const element = readEbmlElement(probeData, offset);
+        if (!element) break;
+
+        if (element.id === '1f43b675') {
+            info.firstClusterOffset = element.start;
+            break;
+        }
+
+        if (element.id === '1549a966') {
+            const infoEnd = Math.min(element.dataEnd, segmentEnd);
+            let durationTicks = null;
+            for (let childOffset = element.dataStart; childOffset < infoEnd;) {
+                const child = readEbmlElement(probeData, childOffset);
+                if (!child) break;
+                if (child.id === '2ad7b1') {
+                    info.timecodeScaleNs = readEbmlUint(probeData, child.dataStart, Math.min(child.dataEnd, probeData.length));
+                } else if (child.id === '4489') {
+                    const durationBytes = child.dataEnd - child.dataStart;
+                    let parsedDurationTicks = NaN;
+                    if (durationBytes === 4) {
+                        parsedDurationTicks = probeData.readFloatBE(child.dataStart);
+                    } else if (durationBytes === 8) {
+                        parsedDurationTicks = probeData.readDoubleBE(child.dataStart);
+                    }
+                    if (Number.isFinite(parsedDurationTicks) && parsedDurationTicks > 0) {
+                        durationTicks = parsedDurationTicks;
+                    }
+                }
+                if (child.nextOffset <= childOffset || child.unknownSize) break;
+                childOffset = child.nextOffset;
+            }
+            if (durationTicks !== null) {
+                info.durationMs = durationTicks * Number(info.timecodeScaleNs) / 1_000_000;
+            }
+        } else if (element.id === '1654ae6b') {
+            const tracksEnd = Math.min(element.dataEnd, segmentEnd);
+            let fallbackAudioTrack = null;
+            for (let trackOffset = element.dataStart; trackOffset < tracksEnd;) {
+                const trackEntry = readEbmlElement(probeData, trackOffset);
+                if (!trackEntry) break;
+                if (trackEntry.id === 'ae') {
+                    const entryEnd = Math.min(trackEntry.dataEnd, tracksEnd);
+                    let trackNumber = null;
+                    let trackType = null;
+                    let codecId = null;
+                    let codecDelayNs = null;
+                    let seekPreRollNs = null;
+                    for (let fieldOffset = trackEntry.dataStart; fieldOffset < entryEnd;) {
+                        const field = readEbmlElement(probeData, fieldOffset);
+                        if (!field) break;
+                        const fieldEnd = Math.min(field.dataEnd, probeData.length);
+                        if (field.id === 'd7') trackNumber = Number(readEbmlUint(probeData, field.dataStart, fieldEnd));
+                        else if (field.id === '83') trackType = Number(readEbmlUint(probeData, field.dataStart, fieldEnd));
+                        else if (field.id === '86') codecId = probeData.subarray(field.dataStart, fieldEnd).toString('utf8');
+                        else if (field.id === '56aa') codecDelayNs = readEbmlUint(probeData, field.dataStart, fieldEnd);
+                        else if (field.id === '56bb') seekPreRollNs = readEbmlUint(probeData, field.dataStart, fieldEnd);
+                        if (field.nextOffset <= fieldOffset || field.unknownSize) break;
+                        fieldOffset = field.nextOffset;
+                    }
+                    if (trackType === 2 && Number.isSafeInteger(trackNumber)) {
+                        const candidate = {
+                            trackNumber,
+                            codecId,
+                            codecDelayNs: codecDelayNs ?? 0n,
+                            seekPreRollNs: seekPreRollNs ?? 80000000n
+                        };
+                        if (fallbackAudioTrack === null) fallbackAudioTrack = candidate;
+                        if (codecId === 'A_OPUS') {
+                            fallbackAudioTrack = candidate;
+                            break;
+                        }
+                    }
+                }
+                if (trackEntry.nextOffset <= trackOffset || trackEntry.unknownSize) break;
+                trackOffset = trackEntry.nextOffset;
+            }
+            if (fallbackAudioTrack) {
+                info.audioTrackNumber = fallbackAudioTrack.trackNumber;
+                info.codecId = fallbackAudioTrack.codecId;
+                info.codecDelayNs = fallbackAudioTrack.codecDelayNs;
+                info.seekPreRollNs = fallbackAudioTrack.seekPreRollNs;
+            }
+        }
+
+        if (element.nextOffset <= offset || element.unknownSize) break;
+        offset = element.nextOffset;
+    }
+
+    return info;
+};
+
+const parseWebmCues = (buffer) => {
+    const cuesId = Buffer.from([0x1c, 0x53, 0xbb, 0x6b]);
+    const cuePoints = [];
+    let searchFrom = buffer.length;
+
+    while (searchFrom > 0) {
+        const cueOffset = buffer.lastIndexOf(cuesId, searchFrom - 1);
+        if (cueOffset < 0) break;
+        const cues = readEbmlElement(buffer, cueOffset);
+        if (cues && cues.id === '1c53bb6b' && !cues.unknownSize && cues.dataEnd <= buffer.length) {
+            for (let pointOffset = cues.dataStart; pointOffset < cues.dataEnd;) {
+                const point = readEbmlElement(buffer, pointOffset);
+                if (!point) break;
+                if (point.id === 'bb') {
+                    let cueTime = null;
+                    const positions = [];
+                    for (let childOffset = point.dataStart; childOffset < point.dataEnd;) {
+                        const child = readEbmlElement(buffer, childOffset);
+                        if (!child) break;
+                        if (child.id === 'b3') {
+                            cueTime = readEbmlUint(buffer, child.dataStart, child.dataEnd);
+                        } else if (child.id === 'b7') {
+                            let cueTrack = null;
+                            let clusterPosition = null;
+                            for (let positionOffset = child.dataStart; positionOffset < child.dataEnd;) {
+                                const field = readEbmlElement(buffer, positionOffset);
+                                if (!field) break;
+                                if (field.id === 'f7') cueTrack = Number(readEbmlUint(buffer, field.dataStart, field.dataEnd));
+                                else if (field.id === 'f1') clusterPosition = readEbmlUint(buffer, field.dataStart, field.dataEnd);
+                                if (field.nextOffset <= positionOffset || field.unknownSize) break;
+                                positionOffset = field.nextOffset;
+                            }
+                            if (clusterPosition !== null) positions.push({ cueTrack, clusterPosition });
+                        }
+                        if (child.nextOffset <= childOffset || child.unknownSize) break;
+                        childOffset = child.nextOffset;
+                    }
+                    if (cueTime !== null) {
+                        for (const position of positions) cuePoints.push({ cueTime, ...position });
+                    }
+                }
+                if (point.nextOffset <= pointOffset || point.unknownSize) break;
+                pointOffset = point.nextOffset;
+            }
+            if (cuePoints.length) return cuePoints;
+        }
+        searchFrom = cueOffset;
+    }
+
+    return cuePoints;
+};
+
+const readBlockVint = (buffer, offset) => {
+    const value = readEbmlVint(buffer, offset, true);
+    if (!value || value.value > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+    return { value: Number(value.value), length: value.length };
+};
+
+const parseOpusBlockPackets = (data) => {
+    const track = readBlockVint(data, 0);
+    if (!track || track.length + 3 > data.length) return null;
+    let offset = track.length;
+    const relativeTimecode = data.readInt16BE(offset);
+    offset += 2;
+    const flags = data[offset++];
+    const lacing = (flags >> 1) & 0x03;
+    if (lacing === 0) return { trackNumber: track.value, relativeTimecode, packets: [data.subarray(offset)] };
+    if (offset >= data.length) return null;
+
+    const frameCount = (data[offset++] ?? 0) + 1;
+    if (frameCount < 1 || frameCount > 256) return null;
+    if (lacing === 2) {
+        const payloadLength = data.length - offset;
+        if (payloadLength % frameCount !== 0) return null;
+        const frameLength = payloadLength / frameCount;
+        const packets = [];
+        for (let index = 0; index < frameCount; index++) {
+            const start = offset + index * frameLength;
+            packets.push(data.subarray(start, start + frameLength));
+        }
+        return { trackNumber: track.value, relativeTimecode, packets };
+    }
+
+    const sizes = [];
+    let declaredSize = 0;
+    if (lacing === 1) {
+        for (let index = 0; index < frameCount - 1; index++) {
+            let frameSize = 0;
+            let byte;
+            do {
+                if (offset >= data.length) return null;
+                byte = data[offset++];
+                frameSize += byte;
+            } while (byte === 255);
+            sizes.push(frameSize);
+            declaredSize += frameSize;
+        }
+    } else if (lacing === 3) {
+        const first = readBlockVint(data, offset);
+        if (!first) return null;
+        offset += first.length;
+        let previousSize = first.value;
+        sizes.push(previousSize);
+        declaredSize += previousSize;
+        for (let index = 1; index < frameCount - 1; index++) {
+            const deltaVint = readEbmlVint(data, offset, true);
+            if (!deltaVint || deltaVint.value > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+            offset += deltaVint.length;
+            const bias = (1n << BigInt(7 * deltaVint.length - 1)) - 1n;
+            const nextSize = BigInt(previousSize) + deltaVint.value - bias;
+            if (nextSize < 0n || nextSize > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+            previousSize = Number(nextSize);
+            sizes.push(previousSize);
+            declaredSize += previousSize;
+        }
+    } else {
+        return null;
+    }
+
+    const lastSize = data.length - offset - declaredSize;
+    if (lastSize < 0) return null;
+    sizes.push(lastSize);
+    const packets = [];
+    let cursor = offset;
+    for (const size of sizes) {
+        if (!Number.isSafeInteger(size) || size <= 0 || cursor + size > data.length) return null;
+        packets.push(data.subarray(cursor, cursor + size));
+        cursor += size;
+    }
+    if (cursor !== data.length) return null;
+    return { trackNumber: track.value, relativeTimecode, packets };
+};
+
+const getOpusPacketDurationMs = (packet) => {
+    const toc = packet[0];
+    if (toc === undefined) return 20;
+    const config = toc >> 3;
+    let frameDurationMs;
+    if (config >= 16) frameDurationMs = [2.5, 5, 10, 20][config & 0x03] ?? 20;
+    else if (config >= 12) frameDurationMs = (config & 0x01) === 0 ? 10 : 20;
+    else frameDurationMs = [10, 20, 40, 60][config & 0x03] ?? 20;
+
+    const frameCode = toc & 0x03;
+    let frameCount = 1;
+    if (frameCode === 1 || frameCode === 2) frameCount = 2;
+    else if (frameCode === 3) frameCount = packet[1] === undefined ? 0 : (packet[1] >> 2) & 0x3f;
+    const duration = frameDurationMs * frameCount;
+    return frameCount > 0 && duration <= 120 ? duration : 20;
+};
+
+const getWebmAudioEndMs = (buffer, headerInfo) => {
+    if (!headerInfo || headerInfo.codecId !== 'A_OPUS' || !Number.isSafeInteger(headerInfo.audioTrackNumber)) return null;
+    const clusterId = Buffer.from([0x1f, 0x43, 0xb6, 0x75]);
+    let searchFrom = buffer.length;
+    let latestEndMs = null;
+    const timecodeScaleNs = headerInfo.timecodeScaleNs || 1000000n;
+    const codecDelayNs = headerInfo.codecDelayNs || 0n;
+
+    while (searchFrom > 0) {
+        const clusterOffset = buffer.lastIndexOf(clusterId, searchFrom - 1);
+        if (clusterOffset < 0) break;
+        searchFrom = clusterOffset;
+        const cluster = readEbmlElement(buffer, clusterOffset);
+        if (!cluster || cluster.id !== '1f43b675' || cluster.dataStart >= cluster.dataEnd || cluster.dataEnd > buffer.length) continue;
+
+        let clusterTimecode = null;
+        const blockData = [];
+        for (let childOffset = cluster.dataStart; childOffset < cluster.dataEnd;) {
+            const child = readEbmlElement(buffer, childOffset);
+            if (!child || child.nextOffset <= childOffset) break;
+            if (child.id === 'e7') {
+                clusterTimecode = readEbmlUint(buffer, child.dataStart, child.dataEnd);
+            } else if (child.id === 'a3') {
+                blockData.push(buffer.subarray(child.dataStart, child.dataEnd));
+            } else if (child.id === 'a0') {
+                for (let groupOffset = child.dataStart; groupOffset < child.dataEnd;) {
+                    const groupChild = readEbmlElement(buffer, groupOffset);
+                    if (!groupChild || groupChild.nextOffset <= groupOffset) break;
+                    if (groupChild.id === 'a1') blockData.push(buffer.subarray(groupChild.dataStart, groupChild.dataEnd));
+                    groupOffset = groupChild.nextOffset;
+                }
+            }
+            childOffset = child.nextOffset;
+        }
+
+        if (clusterTimecode === null) continue;
+        for (const data of blockData) {
+            const block = parseOpusBlockPackets(data);
+            if (!block || block.trackNumber !== headerInfo.audioTrackNumber) continue;
+            const blockStartNs = (clusterTimecode + BigInt(block.relativeTimecode)) * timecodeScaleNs - codecDelayNs;
+            let packetStartMs = Number(blockStartNs) / 1_000_000;
+            for (const packet of block.packets) {
+                const packetDurationMs = getOpusPacketDurationMs(packet);
+                if (Number.isFinite(packetStartMs) && packetDurationMs > 0) {
+                    const packetEndMs = packetStartMs + packetDurationMs;
+                    if (latestEndMs === null || packetEndMs > latestEndMs) latestEndMs = packetEndMs;
+                }
+                packetStartMs += packetDurationMs;
+            }
+        }
+    }
+
+    if (!Number.isFinite(latestEndMs) || latestEndMs <= 0) return null;
+    if (Number.isFinite(headerInfo.durationMs) && headerInfo.durationMs > 0 && latestEndMs > headerInfo.durationMs + 120) return null;
+    return latestEndMs;
+};
+
+async function loadWebmCueIndex(
+    parsedUrl,
+    contentLength,
+    customHeaders,
+    customRequestFn,
+    headerInfo,
+    cacheEntry,
+    cacheKey,
+    prewarm = false
+) {
+    if (cacheEntry?.cueIndex?.loaded) return cacheEntry.cueIndex;
+
+    // If the small background prewarm is already running, let it finish first.
+    // It may satisfy the seek without downloading the larger fallback tail.
+    if (!prewarm && cacheEntry?.cueIndexPrewarmPromise) {
+        const warmedIndex = await cacheEntry.cueIndexPrewarmPromise;
+        if (warmedIndex?.loaded && cacheEntry.cueIndex?.loaded) {
+            return cacheEntry.cueIndex;
+        }
+    }
+
+    const promiseField = prewarm ? 'cueIndexPrewarmPromise' : 'cueIndexPromise';
+    if (cacheEntry?.[promiseField]) return cacheEntry[promiseField];
+
+    const inflightKey = `${cacheKey || parsedUrl.toString()}|${prewarm ? 'prewarm' : 'full'}`;
+    const loadPromise = getOrCreateSharedPromise(
+        WEBM_CUE_INDEX_INFLIGHT,
+        inflightKey,
+        async () => {
+            const tailLimit = prewarm ? WEBM_SEEK_PREWARM_TAIL_BYTES : 8 * 1024 * 1024;
+            const tailLength = Math.min(contentLength, tailLimit);
+            const tailStart = contentLength - tailLength;
+            const tail = await fetchWithRange(
+                parsedUrl,
+                tailStart,
+                contentLength - 1,
+                customHeaders,
+                customRequestFn
+            );
+            const cuePoints = parseWebmCues(tail);
+            return {
+                loaded: !prewarm || cuePoints.length > 0,
+                cuePoints,
+                audioDurationMs: getWebmAudioEndMs(tail, headerInfo)
+            };
+        }
+    );
+
+    if (cacheEntry) cacheEntry[promiseField] = loadPromise;
+    try {
+        const cueIndex = await loadPromise;
+        if (cacheEntry) {
+            if (cueIndex.loaded) cacheEntry.cueIndex = cueIndex;
+            if (Number.isFinite(cueIndex.audioDurationMs) && cueIndex.audioDurationMs > 0) {
+                cacheEntry.audioDurationMs = cueIndex.audioDurationMs;
+            }
+        }
+        return cueIndex;
+    } finally {
+        if (cacheEntry) cacheEntry[promiseField] = null;
+    }
+}
+
+function selectWebmCueSeekPoint(cuePoints, headerInfo, targetTimeMs, contentLength) {
+    if (!cuePoints?.length || !headerInfo) return null;
+
+    const targetNs = BigInt(Math.max(0, Math.round(targetTimeMs * 1_000_000)));
+    const preRollNs = headerInfo.seekPreRollNs ?? 80000000n;
+    const codecDelayNs = headerInfo.codecDelayNs ?? 0n;
+    let thresholdNs = targetNs - preRollNs + codecDelayNs;
+    if (thresholdNs < 0n) thresholdNs = 0n;
+    const thresholdTicks = thresholdNs / (headerInfo.timecodeScaleNs || 1000000n);
+
+    let trackCues = cuePoints;
+    if (headerInfo.audioTrackNumber !== null) {
+        const audioTrackCues = cuePoints.filter(
+            (cue) => cue.cueTrack === headerInfo.audioTrackNumber
+        );
+        const untypedCues = cuePoints.filter((cue) => cue.cueTrack === null);
+        trackCues = audioTrackCues.length
+            ? audioTrackCues
+            : untypedCues.length
+                ? untypedCues
+                : cuePoints;
+    }
+    if (!trackCues.length) return null;
+
+    let selected = null;
+    for (const cue of trackCues) {
+        if (cue.cueTime <= thresholdTicks && (!selected || cue.cueTime > selected.cueTime)) {
+            selected = cue;
+        }
+    }
+    if (!selected || selected.clusterPosition > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+
+    const clusterOffset = headerInfo.segmentDataOffset + Number(selected.clusterPosition);
+    if (
+        !Number.isSafeInteger(clusterOffset) ||
+        clusterOffset < headerInfo.firstClusterOffset ||
+        clusterOffset + 4 > contentLength
+    ) return null;
+
+    return {
+        clusterOffset,
+        clusterTimeMs: Number(selected.cueTime * (headerInfo.timecodeScaleNs || 1000000n)) / 1_000_000,
+        cueTime: selected.cueTime
+    };
+}
+
+async function findWebmCueSeekPoint(
+    parsedUrl,
+    contentLength,
+    customHeaders,
+    customRequestFn,
+    headerInfo,
+    targetTimeMs,
+    cacheEntry,
+    cacheKey
+) {
+    if (!headerInfo || !Number.isFinite(targetTimeMs) || targetTimeMs <= 0) {
+        return { seekPoint: null, cueIndex: null };
+    }
+    if (!Number.isSafeInteger(contentLength) || contentLength <= 0) {
+        return { seekPoint: null, cueIndex: null };
+    }
+
+    let cueIndex;
+    try {
+        cueIndex = await loadWebmCueIndex(
+            parsedUrl,
+            contentLength,
+            customHeaders,
+            customRequestFn,
+            headerInfo,
+            cacheEntry,
+            cacheKey
+        );
+    } catch {
+        // Preserve the sequential fallback when the tail/index cannot be read.
+        return { seekPoint: null, cueIndex: null };
+    }
+
+    if (!cueIndex.cuePoints.length) {
+        return { seekPoint: null, cueIndex };
+    }
+
+    const seekPoint = selectWebmCueSeekPoint(cueIndex.cuePoints, headerInfo, targetTimeMs, contentLength);
+    if (!seekPoint) return { seekPoint: null, cueIndex };
+
+    // CueClusterPosition is a Segment-relative Cluster offset. Do not issue a
+    // separate 4-byte HTTP request for every new seek: the subsequent media
+    // Range starts at this exact offset and the WebM demuxer validates EBML.
+    return { seekPoint, cueIndex };
 }
 
 function detectContentType(buffer, originalMime, urlString = '') {
@@ -626,11 +1512,26 @@ export async function seekableStream(urlString, startTime, endTime, httpHeaders 
         throw new SeekError('UNSUPPORTED_PROTOCOL', `Unsupported protocol: ${parsedUrl.protocol}. Only http(s) and file:// are supported.`);
     }
 
+    const webmCacheKey = parsedUrl.protocol === 'file:'
+        ? null
+        : createWebmSeekCacheKey(parsedUrl, httpHeaders);
+    let webmCacheEntry = getWebmSeekCache(webmCacheKey);
+    const cachedWebmMetadata = Boolean(
+        webmCacheEntry &&
+        webmCacheEntry.headerInfo &&
+        Buffer.isBuffer(webmCacheEntry.probeData) &&
+        webmCacheEntry.contentLength > 0
+    );
+
     let contentLength = 0;
     let contentType = 'application/octet-stream';
     let acceptRanges = 'none';
 
-    if (parsedUrl.protocol === 'file:') {
+    if (cachedWebmMetadata) {
+        contentLength = webmCacheEntry.contentLength;
+        contentType = webmCacheEntry.contentType || contentType;
+        acceptRanges = webmCacheEntry.acceptRanges || 'bytes';
+    } else if (parsedUrl.protocol === 'file:') {
         try {
             const stats = await fsPromises.stat(parsedUrl.pathname);
 
@@ -651,18 +1552,35 @@ export async function seekableStream(urlString, startTime, endTime, httpHeaders 
         } catch (error) {
             throw new SeekError('FILE_ACCESS_ERROR', `Error accessing local file: ${parsedUrl.pathname}. ${error.message}`);
         }
-    } else {
+    } else if (!cachedWebmMetadata) {
         try {
-            const response = await makeHttpRequest(parsedUrl, { method: 'HEAD', headers: httpHeaders }, customRequestFn);
+            const headMetadata = await getOrCreateSharedPromise(
+                WEBM_HEAD_INFLIGHT,
+                webmCacheKey || parsedUrl.toString(),
+                async () => {
+                    const response = await makeHttpRequest(
+                        parsedUrl,
+                        { method: 'HEAD', headers: httpHeaders },
+                        customRequestFn
+                    );
+                    const result = {
+                        statusCode: response.statusCode,
+                        contentLength: parseInt(response.headers?.['content-length'], 10) || 0,
+                        contentType: response.headers?.['content-type'] || 'application/octet-stream',
+                        acceptRanges: response.headers?.['accept-ranges'] || 'none'
+                    };
+                    response.resume();
+                    return result;
+                }
+            );
 
-            if (response.statusCode >= 400) {
-                 meta.warnings.push(`HEAD error ${response.statusCode}, trying blind probe.`);
+            if (headMetadata.statusCode >= 400) {
+                meta.warnings.push(`HEAD error ${headMetadata.statusCode}, trying blind probe.`);
             } else {
-                contentLength = parseInt(response.headers['content-length'], 10) || 0;
-                contentType = response.headers['content-type'] || contentType;
-                acceptRanges = response.headers['accept-ranges'] || acceptRanges;
+                contentLength = headMetadata.contentLength;
+                contentType = headMetadata.contentType || contentType;
+                acceptRanges = headMetadata.acceptRanges || acceptRanges;
             }
-            response.resume();
 
         } catch (error) {
             meta.warnings.push(`Could not retrieve HEAD metadata for ${urlString}. Error: ${error.message}`);
@@ -670,9 +1588,11 @@ export async function seekableStream(urlString, startTime, endTime, httpHeaders 
     }
 
     const PROBE_BYTES = 32 * 1024;
-    let probeData = Buffer.alloc(0);
+    let probeData = cachedWebmMetadata ? Buffer.from(webmCacheEntry.probeData) : Buffer.alloc(0);
 
-    if (parsedUrl.protocol === 'file:') {
+    if (cachedWebmMetadata) {
+        // HEAD and the initial EBML probe are already stored for this media URL.
+    } else if (parsedUrl.protocol === 'file:') {
         try {
             const fileHandle = await fsPromises.open(parsedUrl.pathname, 'r');
             const buffer = Buffer.alloc(PROBE_BYTES);
@@ -685,7 +1605,11 @@ export async function seekableStream(urlString, startTime, endTime, httpHeaders 
     } else {
         try {
             const probeEnd = contentLength > 0 ? Math.min(contentLength - 1, PROBE_BYTES - 1) : PROBE_BYTES - 1;
-            probeData = await fetchWithRange(parsedUrl, 0, probeEnd, httpHeaders, customRequestFn);
+            probeData = await getOrCreateSharedPromise(
+                WEBM_PROBE_INFLIGHT,
+                `${webmCacheKey || parsedUrl.toString()}|probe:${probeEnd}`,
+                () => fetchWithRange(parsedUrl, 0, probeEnd, httpHeaders, customRequestFn)
+            );
         } catch (error) {
             meta.warnings.push(`HTTP probe error: ${error.message}. Continuing without detailed probe.`);
         }
@@ -717,44 +1641,58 @@ export async function seekableStream(urlString, startTime, endTime, httpHeaders 
         }
     }
 
+    let isWebm = false;
+    let webmHeaderInfo = null;
+    let webmSeekPoint = null;
+
     if (probeData.length > 0) {
-        let isWebm = false;
         if (probeData.length >= 4 && probeData.readUInt32BE(0) === 0x1A45DFA3) {
+            isWebm = true;
+            webmHeaderInfo = getWebmHeaderInfo(probeData);
+            if (Number.isFinite(webmHeaderInfo?.durationMs) && webmHeaderInfo.durationMs > 0) {
+                meta.durationMs = webmHeaderInfo.durationMs;
+                meta.durationSource = 'container';
+            }
+
             try {
                 const decoder = new Decoder();
                 const elms = decoder.decode(probeData);
-
                 const durationEl = elms.find(e => e.name === 'Duration');
                 const timecodeScaleEl = elms.find(e => e.name === 'TimecodeScale');
                 const codecIdEl = elms.find(e => e.name === 'CodecID');
 
                 if (durationEl && durationEl.type !== 'm') {
-                    isWebm = true;
                     const duration = durationEl.value;
-                    const timecodeScale = (timecodeScaleEl && timecodeScaleEl.type !== 'm') ? timecodeScaleEl.value : 1000000;
-                    const codecId = (codecIdEl && codecIdEl.type !== 'm') ? codecIdEl.value : null;
-
+                    const timecodeScale = (timecodeScaleEl && timecodeScaleEl.type !== 'm')
+                        ? timecodeScaleEl.value
+                        : 1000000;
                     meta.durationMs = duration * (timecodeScale / 1000000);
-
-                    let container = 'webm';
-                    let mime = 'audio/webm';
-                    if (codecId === 'A_OPUS') {
-                        mime = 'audio/opus';
-                    } else if (codecId === 'A_VORBIS') {
-                        mime = 'audio/vorbis';
-                    } else if (codecId) {
-                        mime = `audio/webm; codecs=${codecId.toLowerCase()}`;
-                    }
-
-                    meta.contentType = mime;
-                    meta.codec = {
-                        container,
-                        mime,
-                        codecName: codecId,
-                    };
+                    meta.durationSource = 'container';
                 }
+
+                const codecId = webmHeaderInfo?.codecId ?? (
+                    codecIdEl && codecIdEl.type !== 'm' ? codecIdEl.value : null
+                );
+                const mime = codecId === 'A_OPUS'
+                    ? 'audio/opus'
+                    : codecId === 'A_VORBIS'
+                        ? 'audio/vorbis'
+                        : codecId
+                            ? `audio/webm; codecs=${codecId.toLowerCase()}`
+                            : 'audio/webm';
+
+                meta.contentType = mime;
+                meta.codec = {
+                    container: 'webm',
+                    mime,
+                    codecName: codecId
+                };
             } catch (error) {
-                meta.warnings.push(`Error parsing probeData with ts-ebml: ${error.message}. Attempting CodecParser.`);
+                const codecId = webmHeaderInfo?.codecId ?? null;
+                const mime = codecId === 'A_OPUS' ? 'audio/opus' : 'audio/webm';
+                meta.contentType = mime;
+                meta.codec = { container: 'webm', mime, codecName: codecId };
+                meta.warnings.push(`Error parsing probeData with ts-ebml: ${error.message}. Using the bounded EBML header parser.`);
             }
         }
 
@@ -782,6 +1720,50 @@ export async function seekableStream(urlString, startTime, endTime, httpHeaders 
         }
     }
 
+    if (
+        isWebm &&
+        webmCacheKey &&
+        contentLength > 0 &&
+        acceptRanges === 'bytes' &&
+        webmHeaderInfo
+    ) {
+        webmCacheEntry = webmCacheEntry || {};
+        webmCacheEntry.contentLength = contentLength;
+        webmCacheEntry.contentType = detectContentType(probeData, contentType, urlString);
+        webmCacheEntry.acceptRanges = acceptRanges;
+        webmCacheEntry.probeData = Buffer.from(probeData);
+        webmCacheEntry.headerInfo = webmHeaderInfo;
+        webmCacheEntry.cueIndex = webmCacheEntry.cueIndex || null;
+        webmCacheEntry.prefixBuffer = webmCacheEntry.prefixBuffer || null;
+        webmCacheEntry.prefixPromise = webmCacheEntry.prefixPromise || null;
+        // The first play request already fetched the EBML probe. Reuse those
+        // bytes as the header prefix whenever the complete prefix is present.
+        if (webmHeaderInfo.firstClusterOffset <= probeData.length && !webmCacheEntry.prefixBuffer) {
+            webmCacheEntry.prefixBuffer = Buffer.from(
+                probeData.subarray(0, webmHeaderInfo.firstClusterOffset)
+            );
+        }
+        webmCacheEntry.cueIndexPrewarmPromise = webmCacheEntry.cueIndexPrewarmPromise || null;
+        webmCacheEntry = setWebmSeekCache(webmCacheKey, webmCacheEntry);
+
+        // Warm a small tail window without delaying initial playback. Most
+        // WebM Cues are near EOF, so the first actual seek can often use the
+        // in-memory index immediately. Larger fallback reads happen only if
+        // a later seek proves the small window did not contain Cues.
+        if (WEBM_SEEK_PREWARM_ENABLED && startTime === 0 && !webmCacheEntry.cueIndex) {
+            void loadWebmCueIndex(
+                parsedUrl,
+                contentLength,
+                httpHeaders,
+                customRequestFn,
+                webmHeaderInfo,
+                webmCacheEntry,
+                webmCacheKey,
+                true
+            ).catch(() => {});
+        }
+    }
+
     let startByte = 0;
     let endByte = contentLength > 0 ? contentLength - 1 : Infinity;
     let effectiveDurationMs = meta.durationMs;
@@ -793,9 +1775,63 @@ export async function seekableStream(urlString, startTime, endTime, httpHeaders 
 
     if (effectiveDurationMs > 0 && !meta.durationMs) {
         meta.durationMs = effectiveDurationMs;
+        meta.durationSource = 'estimated';
     }
 
-    if (acceptRanges === 'bytes' && contentLength > 0 && effectiveDurationMs > 0) {
+    if (isWebm && typeof startTime === 'number' && startTime > 0) {
+        // WebM bitrate is not constant. Never estimate a byte offset from
+        // duration/contentLength; use Cues when available, otherwise decode
+        // sequentially from byte zero and trim PCM by the actual block times.
+        startByte = 0;
+        endByte = contentLength > 0 ? contentLength - 1 : Infinity;
+
+        if (
+            parsedUrl.protocol !== 'file:' &&
+            acceptRanges === 'bytes' &&
+            contentLength > 0 &&
+            webmHeaderInfo?.firstClusterOffset !== null &&
+            webmHeaderInfo?.firstClusterOffset !== undefined
+        ) {
+            const webmSeekResult = await findWebmCueSeekPoint(
+                parsedUrl,
+                contentLength,
+                httpHeaders,
+                customRequestFn,
+                webmHeaderInfo,
+                startTime,
+                webmCacheEntry,
+                webmCacheKey
+            );
+            webmSeekPoint = webmSeekResult.seekPoint;
+            if (webmSeekResult.cueIndex && webmCacheEntry) {
+                webmCacheEntry.cueIndex = webmSeekResult.cueIndex;
+                if (Number.isFinite(webmSeekResult.cueIndex.audioDurationMs) && webmSeekResult.cueIndex.audioDurationMs > 0) {
+                    webmCacheEntry.audioDurationMs = webmSeekResult.cueIndex.audioDurationMs;
+                }
+                setWebmSeekCache(webmCacheKey, webmCacheEntry);
+            }
+            if (webmSeekPoint) startByte = webmSeekPoint.clusterOffset;
+            if (Number.isFinite(webmCacheEntry?.audioDurationMs) && webmCacheEntry.audioDurationMs > 0) {
+                webmHeaderInfo.audioDurationMs = webmCacheEntry.audioDurationMs;
+            }
+            if (Number.isFinite(webmHeaderInfo?.audioDurationMs) && webmHeaderInfo.audioDurationMs > 0) {
+                meta.audioDurationMs = webmHeaderInfo.audioDurationMs;
+                meta.audioDurationSource = 'audio-packets';
+            }
+        }
+
+        if (!webmSeekPoint) {
+            meta.warnings.push(
+                'WebM seek index unavailable; falling back to sequential decoding from the beginning.'
+            );
+        }
+
+        if (typeof endTime === 'number' && endTime > 0) {
+            meta.warnings.push(
+                'WebM endTime byte truncation is disabled because duration-to-byte mapping is not reliable for variable-bitrate media.'
+            );
+        }
+    } else if (acceptRanges === 'bytes' && contentLength > 0 && effectiveDurationMs > 0) {
         if (typeof startTime === 'number' && startTime > 0) {
             startByte = Math.floor((startTime / effectiveDurationMs) * contentLength);
         } else {
@@ -812,7 +1848,7 @@ export async function seekableStream(urlString, startTime, endTime, httpHeaders 
             endByte = contentLength > 0 ? contentLength - 1 : Infinity;
         }
     } else if (startTime !== undefined || (endTime !== undefined && endTime !== null)) {
-        meta.warnings.push('Server does not support byte ranges or unknown Content-Length. Full streaming will be attempted, ignoring startTime/endTime.');
+        meta.warnings.push('Server does not support byte ranges or unknown Content-Length. Full streaming will be attempted, ignoring byte-range seeking.');
     }
 
     meta.resolvedRange = { start: startByte, end: endByte };
@@ -869,80 +1905,104 @@ export async function seekableStream(urlString, startTime, endTime, httpHeaders 
         return { stream: finalStream, meta };
     }
 
-    if (meta.codec && meta.codec.container === 'webm' && startByte > 0) {
+    if (
+        isWebm &&
+        webmSeekPoint &&
+        webmHeaderInfo &&
+        webmHeaderInfo.firstClusterOffset !== null
+    ) {
         const { PassThrough } = await import('stream');
         const finalStream = new PassThrough();
+        const headerEndOffset = webmHeaderInfo.firstClusterOffset;
+        const selectedClusterOffset = webmSeekPoint.clusterOffset;
+
+        const writeChunk = async (chunk) => {
+            if (finalStream.destroyed) return false;
+            if (finalStream.write(chunk)) return true;
+
+            await new Promise((resolve) => {
+                const finish = () => {
+                    finalStream.removeListener('drain', finish);
+                    finalStream.removeListener('close', finish);
+                    finalStream.removeListener('error', finish);
+                    resolve();
+                };
+                finalStream.once('drain', finish);
+                finalStream.once('close', finish);
+                finalStream.once('error', finish);
+            });
+            return !finalStream.destroyed;
+        };
 
         const pipeMedia = async () => {
             try {
-                let headerEndOffset = null;
+                let cachedPrefix = null;
                 try {
-                    const decoder = new Decoder();
-                    const elms = decoder.decode(probeData);
-                    const clusterEl = elms.find(e => e.name === 'Cluster');
-                    headerEndOffset = clusterEl ? clusterEl.tagStart : null;
-                } catch (e) {
+                    cachedPrefix = await getWebmHeaderPrefix(
+                        parsedUrl,
+                        headerEndOffset,
+                        httpHeaders,
+                        customRequestFn,
+                        webmCacheEntry,
+                        webmCacheKey
+                    );
+                } catch {
+                    // Fall back to the retrying chunk stream if the small
+                    // prefix request was interrupted.
+                    cachedPrefix = null;
                 }
 
-                if (headerEndOffset === null) {
-                    const rawStream = createHttpStream(parsedUrl, startByte, endByte, httpHeaders, customRequestFn);
-                    rawStream.pipe(finalStream);
-                    return;
+                if (cachedPrefix) {
+                    if (!(await writeChunk(cachedPrefix))) return;
+                } else {
+                    const headerStream = createHttpStream(
+                        parsedUrl,
+                        0,
+                        headerEndOffset - 1,
+                        httpHeaders,
+                        customRequestFn
+                    );
+                    for await (const chunk of headerStream) {
+                        if (!(await writeChunk(chunk))) return;
+                    }
                 }
 
-                const headerStream = createHttpStream(parsedUrl, 0, headerEndOffset - 1, httpHeaders, customRequestFn);
-                for await (const chunk of headerStream) {
-                    finalStream.write(chunk);
-                }
-
-                const fragmentStream = createHttpStream(parsedUrl, startByte, endByte, httpHeaders, customRequestFn);
-                const magicCluster = Buffer.from([0x1f, 0x43, 0xb6, 0x75]);
-                let foundCluster = false;
-                let remainder = Buffer.alloc(0);
-
-
+                const fragmentStream = createHttpStream(
+                    parsedUrl,
+                    selectedClusterOffset,
+                    endByte,
+                    httpHeaders,
+                    customRequestFn
+                );
                 for await (const chunk of fragmentStream) {
-                    if (foundCluster) {
-                        finalStream.write(chunk);
-                        continue;
-                    }
-
-                    const buffer = Buffer.concat([remainder, chunk]);
-                    const index = buffer.indexOf(magicCluster);
-
-                    if (index !== -1) {
-                        foundCluster = true;
-                        const validChunk = buffer.slice(index);
-                        finalStream.write(validChunk);
-                    } else {
-                        remainder = buffer.slice(Math.max(0, buffer.length - magicCluster.length + 1));
-                    }
+                    if (!(await writeChunk(chunk))) return;
                 }
 
-                finalStream.end();
-
-            } catch (err) {
-                finalStream.emit('error', err);
+                if (!finalStream.destroyed) finalStream.end();
+            } catch (error) {
+                if (!finalStream.destroyed) finalStream.destroy(error);
             }
         };
 
-        pipeMedia();
+        void pipeMedia();
 
-        const fragmentLength = (endByte === Infinity || contentLength === 0) ? Infinity : (endByte - startByte + 1);
-        let tempHeaderEndOffset = null;
-        try {
-            const decoder = new Decoder();
-            const elms = decoder.decode(probeData);
-            const clusterEl = elms.find(e => e.name === 'Cluster');
-            tempHeaderEndOffset = clusterEl ? clusterEl.tagStart : null;
-        } catch(e) {}
-
-        if (tempHeaderEndOffset) {
-            meta.contentLength = fragmentLength === Infinity ? undefined : tempHeaderEndOffset + fragmentLength;
-        }
-        meta.resolvedRange = { start: 0, end: meta.contentLength ? meta.contentLength - 1 : Infinity };
+        const prefixLength = headerEndOffset;
+        const fragmentLength = contentLength > 0
+            ? Math.max(0, Math.min(contentLength - 1, endByte) - selectedClusterOffset + 1)
+            : undefined;
+        meta.contentLength = fragmentLength === undefined
+            ? undefined
+            : prefixLength + fragmentLength;
+        meta.resolvedRange = {
+            start: 0,
+            end: meta.contentLength === undefined ? Infinity : meta.contentLength - 1
+        };
+        meta.webmSeekClusterTimeMs = webmSeekPoint.clusterTimeMs;
+        meta.webmSeekTargetMs = startTime;
+        meta.webmSeekClusterOffset = selectedClusterOffset;
+        meta.webmSeekPreRollMs = Number(webmHeaderInfo.seekPreRollNs) / 1_000_000;
+        meta.originalSeekRange = { start: selectedClusterOffset, end: endByte };
         meta.webmHeaderPrepended = true;
-        meta.originalSeekRange = { start: startByte, end: endByte };
 
         return { stream: finalStream, meta };
     }
